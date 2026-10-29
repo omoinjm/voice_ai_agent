@@ -4,27 +4,58 @@ A voice agent on two channels, sharing one prompt, one set of tools, and one voi
 
 | Channel | Path |
 |---|---|
-| **Real-time calls** (browser and WhatsApp Business calls) | Pipecat bot on EC2 (us-east-1): Deepgram Flux STT (with end-of-turn detection) → Claude Haiku 4.5 on Amazon Bedrock → Deepgram Aura-2 streaming TTS |
+| **Real-time calls** (browser and WhatsApp Business calls) | Pipecat bot on EC2 (us-east-1): Deepgram Flux STT (with end-of-turn detection) → Amazon Nova 2 Lite on Bedrock (Claude Haiku 4.5 once the account has access) → Deepgram Aura-2 streaming TTS |
 | **WhatsApp voice notes** (testing via openwa) | n8n: openwa webhook → Cloudflare Whisper STT → Claude → VoxCPM2 → openwa `send-audio` (PTT) |
+
+Every call is saved to Postgres as it happens (turns, tool calls, bookings), bookings show on a Metabase
+dashboard, and callers get a WhatsApp message confirming any booking made, moved or cancelled on the call.
 
 ```
 WhatsApp call (Cloud API) ─┐   signalling: Cloudflare tunnel; media: UDP to the Elastic IP
 Browser (WebRTC) ──────────┴► EC2 us-east-1 ─ agent/ (Pipecat) ──► Deepgram Flux STT
-                                              │  Claude Haiku 4.5 (Bedrock) + tools ──► n8n /webhook/tool
+                                              │  Nova 2 Lite (Bedrock) + tools ──► n8n /webhook/tool
+                                              │    reschedule/cancel ──────────► Postgres (bookings)
                                               │  Deepgram Aura-2 TTS
-                                              └─ on hang-up ──────► n8n /webhook/post-call (summary)
+                                              ├─ every turn ──────────────────► Postgres (calls, turns, tool calls)
+                                              └─ on hang-up ─► WhatsApp booking confirmation (Cloud API)
+                                                             ─► n8n /webhook/post-call (summary)
+Metabase (bookings.njmtech.co.za) ◄── read-only ── Postgres
 
 WhatsApp voice note ─► openwa-api ─► n8n /webhook/whatsapp-voice ─► cloudflare-stt ─► Claude
                     ◄── send-audio {ptt:true} ◄── VoxCPM2 /v1/audio/speech (ogg/opus)
 ```
 
+## Stack
+
+| Layer | Technology |
+|---|---|
+| Voice pipeline | [Pipecat](https://github.com/pipecat-ai/pipecat) 1.12 (Python 3.12), SmallWebRTC transport for both browser and WhatsApp calls |
+| Speech to text | Deepgram Flux (`flux-general-en`), which also decides when the caller has finished speaking |
+| LLM | Amazon Bedrock: Nova 2 Lite on the server, Claude Haiku 4.5 as the default once enabled; Workers AI GPT-OSS-120B and the Claude API as fallbacks (`agent/llm.py`) |
+| Text to speech | Deepgram Aura-2 over a WebSocket; Workers AI Aura and VoxCPM2 on a Modal L4 GPU as alternatives |
+| Telephony | WhatsApp Cloud API Calling (calls in) and messages (booking confirmations); openwa for voice-note testing |
+| Business tools | n8n (tool webhooks, post-call summary, voice-note flow) |
+| Data | PostgreSQL 17 (`asyncpg`): calls, turns, tool calls, bookings |
+| Dashboard | Metabase, reading Postgres through a read-only role |
+| Hosting | One EC2 c7i-flex.large (Ubuntu 24.04, pinned image) running Docker Compose; Elastic IP for call audio |
+| Networking | Cloudflare Tunnel (`voice-agent.` and `bookings.njmtech.co.za`); no SSH or open TCP ports |
+| Infrastructure as code | CloudFormation (`infra/ec2.yaml`, `infra/github-ci.yaml`); admin through SSM only |
+| Secrets | `.env` locally, stored on AWS as an SSM SecureString; never in GitHub |
+| CI/CD | GitHub Actions: ruff, shellcheck, cfn-lint, compose check, image build; deploys `main` over SSM through a GitHub OIDC role |
+| Dependencies | uv (locked in `agent/uv.lock`), Docker images for everything |
+
+## Layout
+
 | Path | What |
 |---|---|
-| `tts/modal_app.py` | VoxCPM2 on a Modal L4 GPU (scale-to-zero). `/v1/audio/speech` (wav/ogg/pcm), `/v1/audio/stream` (chunked PCM16), `/health` |
-| `agent/` | Pipecat bot (`bot.py`), LLM choice (`llm.py`: Bedrock, Workers AI or Claude API), Workers AI LLM adapter (`cloudflare_llm.py`), TTS services (`cloudflare_tts.py`, `voxcpm_tts.py`), a headless test (`_smoke_test.py`), n8n-backed tools (`tools.py`) |
+| `agent/` | Pipecat bot (`bot.py`), LLM choice (`llm.py`: Bedrock, Workers AI or Claude API), tools (`tools.py`: n8n-backed tools plus booking reschedule/cancel), call records (`store.py`), WhatsApp booking messages (`notify.py`), TTS services (`cloudflare_tts.py`, `voxcpm_tts.py`), Workers AI LLM adapter (`cloudflare_llm.py`), test scripts (`_smoke_test.py`, `_call_test.py`) |
 | `shared/system.md`, `shared/tools.json` | One persona and one tool list, used by both the bot and n8n |
-| `infra/ec2.yaml`, `scripts/deploy-server.sh` | The EC2 server (CloudFormation) and its deploy script |
+| `db/` | Postgres schema (`10-schema.sql`, re-applied on every release) and dashboard roles (`20-roles.sh`) |
 | `n8n-workflows/` | `whatsapp_voice_note`, `agent_tools` (the tool implementations; stubs for now), `post_call` |
+| `tts/modal_app.py` | VoxCPM2 on a Modal L4 GPU (scale-to-zero). `/v1/audio/speech` (wav/ogg/pcm), `/v1/audio/stream` (chunked PCM16), `/health` |
+| `infra/` | The EC2 server (`ec2.yaml`) and the GitHub Actions deploy role (`github-ci.yaml`), in CloudFormation |
+| `scripts/` | `deploy-server.sh` (infra, env, release, run on the server), `metabase-setup.py` (dashboard setup) |
+| `.github/workflows/ci-cd.yml` | Checks on every push and PR; deploys `main` to the server |
 
 ## Setup
 

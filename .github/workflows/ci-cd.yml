@@ -68,14 +68,17 @@ jobs:
       - name: Release to EC2
         run: scripts/deploy-server.sh release
 
-      - name: Smoke test
+      - name: Smoke test (on the server)
+        # Checked from the server through SSM: Cloudflare answers GitHub's runner IPs with 403 (bot protection).
         run: |
+          scripts/deploy-server.sh run '
           check() {
-            for i in $(seq 1 30); do
-              code=$(curl -s -o /dev/null -w '%{http_code}' -L "$1") && [ "$code" = 200 ] && { echo "$1 OK"; return 0; }
-              sleep 10
-            done
-            echo "::error::$1 returned $code"; return 1
+            for i in $(seq 1 30); do curl -sf -o /dev/null -L "$2" && { echo "$1 OK"; return 0; }; sleep 10; done
+            echo "$1 FAILED: $2"; return 1
           }
-          check https://voice-agent.njmtech.co.za/client/
-          check https://bookings.njmtech.co.za/api/health
+          check "voice agent" http://localhost:7860/client/
+          check "n8n" http://localhost:5679/healthz
+          check "metabase" http://localhost:3000/api/health
+          docker compose exec -T db pg_isready -U voice
+          [ "$(docker inspect -f "{{.State.Running}}" voice-agent-cloudflared-1)" = true ] && echo "tunnel OK"
+          '

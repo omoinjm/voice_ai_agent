@@ -6,9 +6,11 @@ Description: >-
   instance (and its data). Deployed by `scripts/deploy-server.sh ci`.
 
 Parameters:
-  Repo:
+  # The repo uses GitHub's immutable OIDC subjects (owner@ownerId/repo@repoId), so a renamed or re-created repo
+  # with the same name can't assume the role. From: gh api repos/omoinjm/voice_ai_agent/actions/oidc/customization/sub
+  RepoSubject:
     Type: String
-    Default: omoinjm/voice_ai_agent
+    Default: repo:omoinjm@86345934/voice_ai_agent@1438327487
   Branch:
     Type: String
     Default: main
@@ -38,7 +40,7 @@ Resources:
               StringEquals:
                 token.actions.githubusercontent.com:aud: sts.amazonaws.com
                 # Only workflow runs on this repo's deploy branch (not PRs, forks or other branches).
-                token.actions.githubusercontent.com:sub: !Sub repo:${Repo}:ref:refs/heads/${Branch}
+                token.actions.githubusercontent.com:sub: !Sub ${RepoSubject}:ref:refs/heads/${Branch}
       Policies:
         - PolicyName: deploy
           PolicyDocument:

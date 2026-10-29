@@ -17,7 +17,7 @@ jobs:
   checks:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Lint Python (ruff)
         run: docker run --rm -v "$PWD:/src:ro" -w /src ghcr.io/astral-sh/ruff:0.14.0 check --no-cache --output-format github agent tts scripts
@@ -53,16 +53,14 @@ jobs:
     concurrency:
       group: deploy-production
       cancel-in-progress: false
-    environment:
-      name: production
-      url: https://voice-agent.njmtech.co.za/client/
+    # No `environment:` here: it changes the OIDC subject the deploy role trusts (refs/heads/main).
     permissions:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: aws-actions/configure-aws-credentials@v4
+      - uses: aws-actions/configure-aws-credentials@v5
         with:
           role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
           aws-region: us-east-1

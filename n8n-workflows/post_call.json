@@ -1,0 +1,54 @@
+{
+  "id": "VoiceAgentPostCall1",
+  "name": "Voice Agent - Post-Call",
+  "nodes": [
+    {
+      "id": "wh_post",
+      "name": "Post-Call Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        300
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "post-call",
+        "responseMode": "onReceived",
+        "options": {}
+      },
+      "webhookId": "9e1f7a2c-3b4d-4e5f-a6b7-c8d9e0f1a203"
+    },
+    {
+      "id": "summarise",
+      "name": "Summarise Call",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        300
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Receives { callId, channel, startedAt, endedAt, transcript: [{role, content}] } from the bot\n// when a call ends. Summarises with Claude and keeps the last 50 calls in static data.\n// Swap the storage for a DB/CRM/email node when you have one.\nconst req = $input.first().json;\nif (($env.TOOLS_SECRET || '') && req.headers['x-tools-secret'] !== $env.TOOLS_SECRET) return [];\nconst call = req.body || {};\nconst lines = (call.transcript || []).map(m => `${m.role === 'user' ? 'Caller' : 'Agent'}: ${m.content}`).join('\\n');\n\nlet summary = '';\nif (lines) {\n  const res = await this.helpers.httpRequest({\n    method: 'POST',\n    url: 'https://api.anthropic.com/v1/messages',\n    headers: { 'x-api-key': $env.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' },\n    body: {\n      model: $env.CLAUDE_MODEL || 'claude-haiku-4-5',\n      max_tokens: 300,\n      messages: [{ role: 'user', content: `Summarise this call in 2-3 sentences, then list any follow-up actions.\\n\\n${lines}` }],\n    },\n    json: true,\n  });\n  summary = res.content.filter(b => b.type === 'text').map(b => b.text).join(' ').trim();\n}\n\nconst store = $getWorkflowStaticData('global');\nstore.calls = [...(store.calls || []), { ...call, summary }].slice(-50);\nreturn [{ json: { callId: call.callId, channel: call.channel, summary, turns: (call.transcript || []).length } }];\n"
+      }
+    }
+  ],
+  "connections": {
+    "Post-Call Webhook": {
+      "main": [
+        [
+          {
+            "node": "Summarise Call",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "active": true
+}

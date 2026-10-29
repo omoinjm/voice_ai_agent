@@ -1,0 +1,296 @@
+{
+  "id": "VoiceAgentWaVoice1",
+  "name": "Voice Agent - WhatsApp Voice Notes",
+  "nodes": [
+    {
+      "id": "wh_voice",
+      "name": "WhatsApp Voice Inbound",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        300
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "whatsapp-voice",
+        "responseMode": "onReceived",
+        "options": {}
+      },
+      "webhookId": "7c3a6c55-0f0e-4f5b-9a39-6f2a3c8d9e01"
+    },
+    {
+      "id": "prep",
+      "name": "Prepare Inbound",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        300
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// OpenWA core webhook delivery: { event: 'message.received', sessionId, data: {...} }.\n// Voice notes carry the audio inline as data.media.data (base64) unless it exceeded\n// WEBHOOK_MEDIA_INLINE_MAX_BYTES, in which case media.omitted is set and we download it.\nconst VOICE_TYPES = ['voice', 'ptt', 'audio'];\nconst allowed = ($env.ALLOWED_PHONE_NUMBERS || '').split(',').map(s => s.replace(/\\D/g, '')).filter(Boolean);\n\nconst out = [];\nfor (const item of $input.all()) {\n  const body = item.json.body || item.json;\n  const data = body.data || {};\n  if (body.event !== 'message.received' || data.fromMe || data.isGroupMsg) continue;\n\n  const chatId = data.chatId || data.from || '';\n  const phone = (data.senderPhone || data.from || '').split('@')[0].replace(/\\D/g, '');\n  if (!chatId.endsWith('@c.us') && !chatId.endsWith('@lid')) continue; // skip groups, status, newsletters\n  if (allowed.length && !allowed.includes(phone)) continue;\n\n  const isVoice = VOICE_TYPES.includes(data.type);\n  const text = isVoice ? '' : (data.body || '').trim();\n  if (!isVoice && (data.type !== 'chat' || !text)) continue;\n\n  const result = { json: { chatId, phone, messageId: data.id || null, isVoice, text } };\n  if (isVoice) {\n    const media = data.media || {};\n    let b64 = media.data;\n    if (!b64) {\n      const buf = await this.helpers.httpRequest({\n        method: 'GET',\n        url: `${$env.OPENWA_URL}/api/sessions/${$env.OPENWA_SESSION_ID}/messages/${encodeURIComponent(chatId)}/${encodeURIComponent(data.id)}/media`,\n        headers: { 'X-API-Key': $env.OPENWA_API_KEY },\n        encoding: 'arraybuffer',\n      });\n      b64 = Buffer.from(buf).toString('base64');\n    }\n    result.binary = { audio: { data: b64, mimeType: (media.mimetype || 'audio/ogg').split(';')[0], fileName: 'voice.ogg' } };\n  }\n  out.push(result);\n}\nreturn out;\n"
+      }
+    },
+    {
+      "id": "if_voice",
+      "name": "Is Voice Note?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        440,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.isVoice }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ]
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      }
+    },
+    {
+      "id": "stt",
+      "name": "Transcribe",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        660,
+        200
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "={{$env.STT_BASE_URL}}/v1/audio/transcriptions",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{$env.STT_API_KEY}}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "multipart-form-data",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "parameterType": "formBinaryData",
+              "name": "file",
+              "inputDataFieldName": "audio"
+            },
+            {
+              "name": "model",
+              "value": "whisper-large-v3-turbo"
+            },
+            {
+              "name": "language",
+              "value": "en"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 60000
+        }
+      }
+    },
+    {
+      "id": "agent",
+      "name": "Agent Reply",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        880,
+        300
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// One Claude turn with tool use. The system prompt and tool schemas are the same files the\n// real-time bot uses (mounted at /shared), and tools are executed by this n8n's own\n// /webhook/tool workflow, so both channels behave the same.\nconst fs = require('fs');\nconst inbound = $('Prepare Inbound').first().json;\nconst text = (inbound.isVoice ? $json.text : inbound.text || '').trim();\nif (!text) return [];\n\nconst system = fs.readFileSync('/shared/system.md', 'utf8') +\n  `\\nThis conversation is over WhatsApp voice notes. The customer's WhatsApp number is ${inbound.phone || 'unknown'}.`;\nconst tools = JSON.parse(fs.readFileSync('/shared/tools.json', 'utf8'));\n\n// Short per-chat history in workflow static data (persists for active, production executions).\nconst store = $getWorkflowStaticData('global');\nstore.history = store.history || {};\nconst history = (store.history[inbound.chatId] || []).slice(-12);\nconst messages = [...history, { role: 'user', content: text }];\n\nconst callClaude = (msgs) => this.helpers.httpRequest({\n  method: 'POST',\n  url: 'https://api.anthropic.com/v1/messages',\n  headers: { 'x-api-key': $env.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' },\n  body: { model: $env.CLAUDE_MODEL || 'claude-haiku-4-5', max_tokens: 400, system, tools, messages: msgs },\n  json: true,\n});\n\nlet reply = '';\nfor (let turn = 0; turn < 4; turn++) {\n  const res = await callClaude(messages);\n  messages.push({ role: 'assistant', content: res.content });\n  const toolUses = res.content.filter(b => b.type === 'tool_use');\n  if (res.stop_reason !== 'tool_use' || !toolUses.length) {\n    reply = res.content.filter(b => b.type === 'text').map(b => b.text).join(' ').trim();\n    break;\n  }\n  const results = [];\n  for (const t of toolUses) {\n    let output;\n    try {\n      output = await this.helpers.httpRequest({\n        method: 'POST',\n        url: 'http://localhost:5678/webhook/tool',\n        headers: { 'X-Tools-Secret': $env.TOOLS_SECRET },\n        body: { tool: t.name, input: t.input, channel: 'whatsapp', phone: inbound.phone },\n        json: true,\n      });\n    } catch (e) {\n      output = { error: `Tool ${t.name} failed: ${e.message}` };\n    }\n    results.push({ type: 'tool_result', tool_use_id: t.id, content: JSON.stringify(output) });\n  }\n  messages.push({ role: 'user', content: results });\n}\nif (!reply) reply = \"Sorry, I couldn't sort that out just now. Someone will get back to you shortly.\";\n\n// Keep only plain text turns in history; tool round-trips aren't needed for later context.\nstore.history[inbound.chatId] = [...history, { role: 'user', content: text }, { role: 'assistant', content: reply }].slice(-12);\nreturn [{ json: { chatId: inbound.chatId, messageId: inbound.messageId, transcript: text, reply } }];\n"
+      }
+    },
+    {
+      "id": "tts",
+      "name": "Synthesize Speech",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1100,
+        300
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "={{$env.VOXCPM_URL}}/v1/audio/speech",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{$env.VOXCPM_TOKEN}}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ input: $json.reply, response_format: 'ogg' }) }}",
+        "options": {
+          "timeout": 180000,
+          "response": {
+            "response": {
+              "responseFormat": "file",
+              "outputPropertyName": "data"
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "encode",
+      "name": "Encode Audio",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1320,
+        300
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const out = [];\nfor (let i = 0; i < $input.all().length; i++) {\n  const buf = await this.helpers.getBinaryDataBuffer(i, 'data');\n  out.push({ json: { chatId: $('Agent Reply').first().json.chatId, base64: buf.toString('base64') } });\n}\nreturn out;\n"
+      }
+    },
+    {
+      "id": "send_audio",
+      "name": "Send Voice Note",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1540,
+        300
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "={{$env.OPENWA_URL}}/api/sessions/{{$env.OPENWA_SESSION_ID}}/messages/send-audio",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-API-Key",
+              "value": "={{$env.OPENWA_API_KEY}}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ chatId: $json.chatId, base64: $json.base64, mimetype: 'audio/ogg; codecs=opus', ptt: true }) }}",
+        "options": {}
+      }
+    }
+  ],
+  "connections": {
+    "WhatsApp Voice Inbound": {
+      "main": [
+        [
+          {
+            "node": "Prepare Inbound",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Inbound": {
+      "main": [
+        [
+          {
+            "node": "Is Voice Note?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Voice Note?": {
+      "main": [
+        [
+          {
+            "node": "Transcribe",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Agent Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Transcribe": {
+      "main": [
+        [
+          {
+            "node": "Agent Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Agent Reply": {
+      "main": [
+        [
+          {
+            "node": "Synthesize Speech",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Synthesize Speech": {
+      "main": [
+        [
+          {
+            "node": "Encode Audio",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Encode Audio": {
+      "main": [
+        [
+          {
+            "node": "Send Voice Note",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "active": true
+}

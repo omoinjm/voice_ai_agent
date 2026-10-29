@@ -1,0 +1,125 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Voice agent server: one EC2 instance running the docker compose stack (Pipecat bot, n8n, cloudflared).
+  HTTP reaches it through the Cloudflare tunnel; WebRTC media arrives over UDP on the Elastic IP.
+  Admin access is SSM only (no SSH). Deployed and updated by scripts/deploy-server.sh.
+
+Parameters:
+  InstanceType:
+    Type: String
+    Default: c7i-flex.large  # free-tier eligible on this account (t3.medium is not); 2 vCPU / 4 GB
+  AmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id
+  EnvParameterName:
+    Type: String
+    Default: /voice-agent/env
+    Description: SecureString parameter holding the server's .env (written by deploy-server.sh).
+
+Resources:
+  # Deploy bundles (the repo as a tarball), uploaded by deploy-server.sh and pulled by the instance.
+  DeployBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-old-bundles
+            Status: Enabled
+            ExpirationInDays: 14
+
+  Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: voice-agent
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Claude and Nova through US cross-region inference profiles (so BEDROCK_MODEL can be switched).
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource:
+                  - !Sub arn:aws:bedrock:*:${AWS::AccountId}:inference-profile/us.*
+                  - arn:aws:bedrock:*::foundation-model/anthropic.*
+                  - arn:aws:bedrock:*::foundation-model/amazon.nova*
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub ${DeployBucket.Arn}/*
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${EnvParameterName}
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref Role]
+
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Voice agent - WebRTC media only (HTTP comes through the Cloudflare tunnel)
+      SecurityGroupIngress:
+        # aiortc picks random UDP ports for each call's media.
+        - IpProtocol: udp
+          FromPort: 1024
+          ToPort: 65535
+          CidrIp: 0.0.0.0/0
+
+  Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !Ref AmiId
+      IamInstanceProfile: !Ref InstanceProfile
+      SecurityGroupIds: [!GetAtt SecurityGroup.GroupId]
+      MetadataOptions:
+        HttpTokens: required
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs: { VolumeSize: 30, VolumeType: gp3, Encrypted: true }
+      Tags:
+        - { Key: Name, Value: voice-agent }
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          set -euxo pipefail
+          apt-get update
+          apt-get install -y docker.io docker-compose-v2 docker-buildx
+          snap install aws-cli --classic
+          systemctl enable --now docker
+          # The compose build reads ${HOME}/.cache/uv as a build context; it must exist even when empty.
+          mkdir -p /opt/voice-agent /root/.cache/uv /root/.aws
+
+  ElasticIp:
+    Type: AWS::EC2::EIP
+    Properties:
+      InstanceId: !Ref Instance
+
+Outputs:
+  InstanceId:
+    Value: !Ref Instance
+  PublicIp:
+    Value: !Ref ElasticIp
+  DeployBucket:
+    Value: !Ref DeployBucket
+  EnvParameterName:
+    Value: !Ref EnvParameterName

@@ -1,0 +1,83 @@
+# Checks on every PR and push; pushes to main then deploy to the EC2 server and smoke-test it.
+# Deploying uses the voice-agent-github-deploy role (infra/github-ci.yaml) through GitHub OIDC: no AWS keys are
+# stored here. Its ARN is the repo variable AWS_DEPLOY_ROLE_ARN. The server's .env stays in AWS SSM
+# (`scripts/deploy-server.sh env` from a machine with the .env); this workflow only ships code.
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Lint Python (ruff)
+        run: docker run --rm -v "$PWD:/src:ro" -w /src ghcr.io/astral-sh/ruff:0.14.0 check --no-cache --output-format github agent tts scripts
+
+      - name: Lint shell scripts (shellcheck)
+        run: docker run --rm -v "$PWD:/mnt:ro" koalaman/shellcheck:v0.10.0 --severity=warning scripts/deploy-server.sh db/20-roles.sh
+
+      - name: Validate CloudFormation (cfn-lint)
+        run: |
+          pip install --quiet cfn-lint==1.40.0
+          cfn-lint infra/*.yaml
+
+      - name: Validate docker-compose.yml
+        run: docker compose --profile dashboard config --quiet
+        env:
+          DB_PASSWORD: ci
+
+      - name: Build the agent image
+        run: |
+          # The Dockerfile reads a host uv cache as a build context; CI has none, so it installs from PyPI.
+          mkdir -p "$RUNNER_TEMP/uvcache"
+          docker build --build-context uvcache="$RUNNER_TEMP/uvcache" --build-arg HOST_UV_CACHE=/uvcache \
+            -t voice-agent:ci agent
+
+      - name: Import-check the agent
+        run: docker run --rm -e SHARED_DIR=/shared -v "$PWD/shared:/shared:ro" voice-agent:ci python -c "import bot, store, tools, notify"
+
+  deploy:
+    needs: checks
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    # One deploy at a time; a newer push waits rather than cancelling a deploy halfway.
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    environment:
+      name: production
+      url: https://voice-agent.njmtech.co.za/client/
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Release to EC2
+        run: scripts/deploy-server.sh release
+
+      - name: Smoke test
+        run: |
+          check() {
+            for i in $(seq 1 30); do
+              code=$(curl -s -o /dev/null -w '%{http_code}' -L "$1") && [ "$code" = 200 ] && { echo "$1 OK"; return 0; }
+              sleep 10
+            done
+            echo "::error::$1 returned $code"; return 1
+          }
+          check https://voice-agent.njmtech.co.za/client/
+          check https://bookings.njmtech.co.za/api/health

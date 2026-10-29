@@ -1,0 +1,64 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Voice agent CI/CD: the role GitHub Actions assumes (OIDC, no stored keys) to deploy main to the server.
+  It can only upload the deploy bundle and run commands on the voice-agent instance through SSM.
+  Kept apart from ec2.yaml: updating that stack re-resolves the latest Ubuntu AMI and could replace the
+  instance (and its data). Deployed by `scripts/deploy-server.sh ci`.
+
+Parameters:
+  Repo:
+    Type: String
+    Default: omoinjm/voice_ai_agent
+  Branch:
+    Type: String
+    Default: main
+  AppStackName:
+    Type: String
+    Default: voice-agent
+  InstanceId:
+    Type: AWS::EC2::Instance::Id
+  DeployBucket:
+    Type: String
+
+Resources:
+  DeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: voice-agent-github-deploy
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            # The account's existing GitHub OIDC provider.
+            Principal:
+              Federated: !Sub arn:aws:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                # Only workflow runs on this repo's deploy branch (not PRs, forks or other branches).
+                token.actions.githubusercontent.com:sub: !Sub repo:${Repo}:ref:refs/heads/${Branch}
+      Policies:
+        - PolicyName: deploy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: cloudformation:DescribeStacks
+                Resource: !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AppStackName}/*
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub arn:aws:s3:::${DeployBucket}/bundle.tgz
+              - Effect: Allow
+                Action: ssm:SendCommand
+                Resource:
+                  - !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance/${InstanceId}
+                  - !Sub arn:aws:ssm:${AWS::Region}::document/AWS-RunShellScript
+              - Effect: Allow
+                Action: ssm:GetCommandInvocation
+                Resource: "*"
+
+Outputs:
+  DeployRoleArn:
+    Value: !GetAtt DeployRole.Arn

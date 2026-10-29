@@ -1,0 +1,197 @@
+# Voice agent stack: n8n (business flows + WhatsApp voice notes) and the Pipecat real-time bot.
+# The same file runs on the EC2 server (scripts/deploy-server.sh); only its .env differs.
+# VoxCPM2 TTS runs on Modal (tts/modal_app.py), not here: this machine has no GPU.
+#
+# The openwa gateway is the existing `openwa-api` container (run from the carwash project's
+# openwa-gateway/). Join it to this network once so n8n and the gateway can reach each other:
+#   docker network connect voice_ai_agent_default openwa-api
+services:
+  # Call records: calls, turns, tool calls and bookings (db/: schema + dashboard roles, applied on first start).
+  # Published on 127.0.0.1:5433 only; the agent (host networking) connects there. On the server, query it with
+  #   scripts/deploy-server.sh run 'docker exec voice-db psql -U voice -c "select * from calls order by started_at desc limit 5"'
+  db:
+    image: postgres:17-alpine
+    container_name: voice-db
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5433:5432"
+    environment:
+      - POSTGRES_USER=voice
+      - POSTGRES_DB=voice
+      - POSTGRES_PASSWORD=${DB_PASSWORD:?set DB_PASSWORD in .env}
+      # Used by db/20-roles.sh to create the Metabase roles.
+      - METABASE_DB_PASSWORD=${METABASE_DB_PASSWORD:-}
+      - DASHBOARD_DB_PASSWORD=${DASHBOARD_DB_PASSWORD:-}
+    volumes:
+      - db_data:/var/lib/postgresql/data
+      - ./db:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "voice"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Bookings/calls dashboard. Server only (COMPOSE_PROFILES=dashboard in its .env): it needs ~1 GB of RAM.
+  # Served at https://bookings.njmtech.co.za through the tunnel (ingress -> http://localhost:3000).
+  # Its own settings live in the `metabase` database; it reads call records as the read-only `dashboard` role.
+  metabase:
+    image: metabase/metabase:latest
+    container_name: voice-metabase
+    restart: unless-stopped
+    profiles: ["dashboard"]
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      - MB_DB_TYPE=postgres
+      - MB_DB_HOST=db
+      - MB_DB_PORT=5432
+      - MB_DB_DBNAME=metabase
+      - MB_DB_USER=metabase
+      - MB_DB_PASS=${METABASE_DB_PASSWORD}
+      - MB_SITE_URL=https://bookings.njmtech.co.za
+      - MB_ANON_TRACKING_ENABLED=false
+      - JAVA_TIMEZONE=Africa/Johannesburg
+      - JAVA_OPTS=-Xmx1g
+    depends_on:
+      db:
+        condition: service_healthy
+
+  n8n:
+    image: n8nio/n8n:latest
+    container_name: voice-n8n
+    restart: unless-stopped
+    ports:
+      # 5679 on the host so it can run alongside the carwash n8n on 5678.
+      - "5679:5678"
+    environment:
+      # Workflow nodes read config via {{$env.*}}, which n8n blocks by default.
+      - N8N_BLOCK_ENV_ACCESS_IN_NODE=false
+      # "Agent Reply" reads the shared prompt and tool schemas from /shared.
+      - NODE_FUNCTION_ALLOW_BUILTIN=fs
+      - TZ=Africa/Johannesburg
+      - GENERIC_TIMEZONE=Africa/Johannesburg
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - CLAUDE_MODEL=${CLAUDE_MODEL:-claude-haiku-4-5}
+      - VOXCPM_URL=${VOXCPM_URL}
+      - VOXCPM_TOKEN=${VOXCPM_TOKEN}
+      - STT_BASE_URL=${STT_BASE_URL}
+      - STT_API_KEY=${STT_API_KEY}
+      - OPENWA_URL=${OPENWA_URL:-http://openwa-api:2785}
+      - OPENWA_API_KEY=${OPENWA_API_KEY}
+      - OPENWA_SESSION_ID=${OPENWA_SESSION_ID:-voice-test}
+      - ALLOWED_PHONE_NUMBERS=${ALLOWED_PHONE_NUMBERS}
+      - TOOLS_SECRET=${TOOLS_SECRET}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - n8n_data:/home/node/.n8n
+      - ./n8n-workflows:/workflows:ro
+      - ./shared:/shared:ro
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:5678/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # n8n can mark a workflow active at boot without registering its webhook route; this
+  # one-shot toggles every active workflow off/on after startup (see the script header).
+  n8n-activator:
+    image: node:22-alpine
+    depends_on:
+      n8n:
+        condition: service_healthy
+    environment:
+      - N8N_URL=http://n8n:5678
+      - N8N_OWNER_EMAIL=${N8N_OWNER_EMAIL}
+      - N8N_OWNER_PASSWORD=${N8N_OWNER_PASSWORD}
+    volumes:
+      - ./n8n-workflows:/workflows:ro
+    command: ["node", "/workflows/reactivate-workflows.js"]
+    restart: "no"
+
+  agent:
+    build:
+      context: ./agent
+      # Host uv cache, reused by the Dockerfile so slow PyPI downloads aren't repeated.
+      additional_contexts:
+        uvcache: ${HOME}/.cache/uv
+      args:
+        HOST_UV_CACHE: ${HOME}/.cache/uv
+    container_name: voice-agent
+    restart: unless-stopped
+    # Host networking: WebRTC media uses random UDP ports, which bridge networking won't expose.
+    # Serves http://localhost:7860.
+    network_mode: host
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - CLAUDE_MODEL=${CLAUDE_MODEL:-claude-haiku-4-5}
+      - ANTHROPIC_WORKSPACE_ID=${ANTHROPIC_WORKSPACE_ID:-}
+      - LLM_PROVIDER=${LLM_PROVIDER:-bedrock}
+      - BEDROCK_MODEL=${BEDROCK_MODEL:-us.anthropic.claude-haiku-4-5-20251001-v1:0}
+      - AWS_REGION=${AWS_REGION:-us-east-1}
+      # Bedrock credentials: ~/.aws (mounted below, default profile) locally; on EC2 that folder is empty and
+      # the instance role is used instead.
+      # STUN, so the bot advertises its public IP as a WebRTC candidate when it runs behind NAT (EC2).
+      - PIPECAT_ICE_SERVERS=${PIPECAT_ICE_SERVERS:-}
+      - CF_LLM_MODEL=${CF_LLM_MODEL:-@cf/openai/gpt-oss-120b}
+      - DEEPGRAM_API_KEY=${DEEPGRAM_API_KEY}
+      - VOXCPM_URL=${VOXCPM_URL}
+      - VOXCPM_TOKEN=${VOXCPM_TOKEN}
+      - STT_PROVIDER=${STT_PROVIDER:-flux}
+      - FLUX_EAGER_EOT=${FLUX_EAGER_EOT:-false}
+      - TTS_PROVIDER=${TTS_PROVIDER:-deepgram}
+      - DEEPGRAM_TTS_VOICE=${DEEPGRAM_TTS_VOICE:-aura-2-asteria-en}
+      - CLOUDFLARE_ACCOUNT_ID=${CLOUDFLARE_ACCOUNT_ID}
+      - CLOUDFLARE_AI_TOKEN=${CLOUDFLARE_AI_TOKEN}
+      - CF_TTS_MODEL=${CF_TTS_MODEL:-@cf/deepgram/aura-1}
+      - CF_TTS_SPEAKER=${CF_TTS_SPEAKER:-asteria}
+      - N8N_URL=http://localhost:5679
+      - BUSINESS_NAME=${BUSINESS_NAME:-Demo Co}
+      - DATABASE_URL=postgresql://voice:${DB_PASSWORD}@localhost:5433/voice
+      - TOOLS_SECRET=${TOOLS_SECRET}
+      - WHATSAPP_TOKEN=${WHATSAPP_TOKEN}
+      - WHATSAPP_PHONE_NUMBER_ID=${WHATSAPP_PHONE_NUMBER_ID}
+      - WHATSAPP_APP_SECRET=${WHATSAPP_APP_SECRET}
+      - WHATSAPP_WEBHOOK_VERIFICATION_TOKEN=${WHATSAPP_WEBHOOK_VERIFICATION_TOKEN}
+    # Browser test client + Meta WhatsApp call webhook (POST /whatsapp) on the same server.
+    command: ["python", "bot.py", "-t", "webrtc", "--whatsapp", "--host", "0.0.0.0", "--port", "7860"]
+    volumes:
+      - ./shared:/shared:ro
+      - ${HOME}/.aws:/root/.aws:ro
+    depends_on:
+      n8n:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+
+  # Named tunnel "voice-agent": https://voice-agent.njmtech.co.za -> http://localhost:7860 (ingress is
+  # configured in Cloudflare, not here). Host networking so it reaches the `agent` container on
+  # localhost:7860. Meta's webhook URL: https://voice-agent.njmtech.co.za/whatsapp
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    network_mode: host
+    command: ["tunnel", "--no-autoupdate", "run", "--token", "${CF_TUNNEL_TOKEN}"]
+
+  # Modal CLI for deploying the VoxCPM2 TTS (tts/modal_app.py). Only runs on demand:
+  #   docker compose run --rm modal token new
+  #   docker compose run --rm modal deploy modal_app.py
+  modal:
+    build:
+      context: ./tts/cli
+      additional_contexts:
+        uvcache: ${HOME}/.cache/uv
+      args:
+        HOST_UV_CACHE: ${HOME}/.cache/uv
+    profiles: ["tools"]
+    working_dir: /tts
+    environment:
+      - MODAL_CONFIG_PATH=/config/.modal.toml
+    volumes:
+      - ./tts:/tts
+      - modal_config:/config
+
+volumes:
+  db_data:
+  n8n_data:
+  modal_config:

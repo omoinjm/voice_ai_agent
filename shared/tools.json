@@ -1,0 +1,31 @@
+[
+  {
+    "name": "get_business_info",
+    "description": "Look up Demo Co's opening hours, address, services and prices. Call this before answering any question about the business.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "topic": {
+          "type": "string",
+          "enum": ["hours", "address", "services", "prices", "all"],
+          "description": "What the caller is asking about."
+        }
+      },
+      "required": ["topic"]
+    }
+  },
+  {
+    "name": "create_booking",
+    "description": "Book an appointment once you have the caller's name, the service and a preferred date and time. Confirm the details with the caller before calling this.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "name": { "type": "string", "description": "Caller's full name." },
+        "service": { "type": "string", "description": "The service being booked." },
+        "datetime": { "type": "string", "description": "Requested date and time, ISO 8601 in Africa/Johannesburg time." },
+        "phone": { "type": "string", "description": "Caller's phone number if known." }
+      },
+      "required": ["name", "service", "datetime"]
+    }
+  }
+]

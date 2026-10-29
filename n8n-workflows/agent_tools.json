@@ -1,0 +1,82 @@
+{
+  "id": "VoiceAgentTools0001",
+  "name": "Voice Agent - Tools",
+  "nodes": [
+    {
+      "id": "wh_tool",
+      "name": "Tool Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        300
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "tool",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "webhookId": "2b9d4f1e-5a63-4c0b-8f7e-1d2c3b4a5f02"
+    },
+    {
+      "id": "run_tool",
+      "name": "Run Tool",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        300
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Demo tool implementations. Replace the bodies with real lookups (DB, calendar, CRM) as needed;\n// the contract is: POST /webhook/tool with { tool, input, channel, phone }, respond with JSON.\nconst req = $input.first().json;\nif (($env.TOOLS_SECRET || '') && req.headers['x-tools-secret'] !== $env.TOOLS_SECRET) {\n  return [{ json: { status: 401, body: { error: 'unauthorized' } } }];\n}\nconst name = req.body?.tool;\nconst input = req.body?.input || {};\n\nconst INFO = {\n  hours: 'Monday to Friday 8am to 5pm, Saturday 8am to 1pm, closed Sunday and public holidays.',\n  address: '12 Example Street, Rosebank, Johannesburg.',\n  services: 'Consultations, standard service and premium service.',\n  prices: 'Consultation R250, standard service R450, premium service R800.',\n};\n\nif (name === 'get_business_info') {\n  const topic = input.topic || 'all';\n  return [{ json: { status: 200, body: topic === 'all' ? INFO : { [topic]: INFO[topic] ?? 'Unknown topic.' } } }];\n}\n\nif (name === 'create_booking') {\n  const missing = ['name', 'service', 'datetime'].filter(k => !input[k]);\n  if (missing.length) return [{ json: { status: 200, body: { ok: false, error: `Missing ${missing.join(', ')}` } } }];\n  const store = $getWorkflowStaticData('global');\n  store.bookings = store.bookings || [];\n  const reference = 'BK' + Date.now().toString(36).toUpperCase().slice(-5);\n  store.bookings.push({ reference, ...input, createdAt: new Date().toISOString() });\n  return [{ json: { status: 200, body: { ok: true, reference, ...input } } }];\n}\n\nreturn [{ json: { status: 404, body: { error: `Unknown tool ${name}` } } }];\n"
+      }
+    },
+    {
+      "id": "respond_tool",
+      "name": "Respond",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        440,
+        300
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($json.body) }}",
+        "options": {
+          "responseCode": "={{ $json.status }}"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Tool Webhook": {
+      "main": [
+        [
+          {
+            "node": "Run Tool",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run Tool": {
+      "main": [
+        [
+          {
+            "node": "Respond",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "active": true
+}

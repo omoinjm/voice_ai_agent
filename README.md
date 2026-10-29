@@ -109,8 +109,8 @@ scripts/deploy-server.sh run 'docker compose logs --tail 100 agent'
 - Stop the local `cloudflared` (and `agent`) first: two connectors on the same tunnel split the traffic between them.
 - No SSH or open TCP ports: HTTP comes through the tunnel, admin goes through SSM.
 - To pause costs, stop the instance in the EC2 console (the Elastic IP still costs ~$3.60/month); `docker compose` services restart with it.
-- Don't re-run `infra` casually: the AMI parameter resolves to the latest Ubuntu image, so an update after a new
-  image is published replaces the instance, and the Postgres and n8n data on it.
+- The instance image is pinned in `infra/ec2.yaml` (`ImageId`), so `infra` updates don't replace the instance.
+  Changing `ImageId` would, and it takes the Postgres and n8n data with it, so back up first.
 
 ### 8. Call records and dashboard
 The bot saves calls, turns, tool calls and bookings to Postgres (`db`, schema in `db/10-schema.sql`) as they happen.

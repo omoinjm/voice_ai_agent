@@ -2,8 +2,8 @@ AWSTemplateFormatVersion: "2010-09-09"
 Description: >-
   Voice agent CI/CD: the role GitHub Actions assumes (OIDC, no stored keys) to deploy main to the server.
   It can only upload the deploy bundle and run commands on the voice-agent instance through SSM.
-  Kept apart from ec2.yaml: updating that stack re-resolves the latest Ubuntu AMI and could replace the
-  instance (and its data). Deployed by `scripts/deploy-server.sh ci`.
+  Kept apart from ec2.yaml so CI changes never touch the server stack (an instance replacement there would
+  take its data with it). Deployed by `scripts/deploy-server.sh ci`.
 
 Parameters:
   # The repo uses GitHub's immutable OIDC subjects (owner@ownerId/repo@repoId), so a renamed or re-created repo

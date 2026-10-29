@@ -8,9 +8,12 @@ Parameters:
   InstanceType:
     Type: String
     Default: c7i-flex.large  # free-tier eligible on this account (t3.medium is not); 2 vCPU / 4 GB
-  AmiId:
-    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
-    Default: /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id
+  # Pinned: a "latest Ubuntu" lookup here would replace the instance (and the Postgres/n8n data on it) on the first
+  # stack update after Canonical publishes a new image. This is the image the instance was created from (Ubuntu
+  # 24.04, 2026-10-28). To move to a newer one, plan an instance replacement and back up the data first.
+  ImageId:
+    Type: AWS::EC2::Image::Id
+    Default: ami-0d6dd9e8265d48906
   EnvParameterName:
     Type: String
     Default: /voice-agent/env
@@ -88,7 +91,7 @@ Resources:
     Type: AWS::EC2::Instance
     Properties:
       InstanceType: !Ref InstanceType
-      ImageId: !Ref AmiId
+      ImageId: !Ref ImageId
       IamInstanceProfile: !Ref InstanceProfile
       SecurityGroupIds: [!GetAtt SecurityGroup.GroupId]
       MetadataOptions:

@@ -146,7 +146,8 @@ scripts/deploy-server.sh run 'docker compose logs --tail 100 agent'
 - No SSH or open TCP ports: HTTP comes through the tunnel, admin goes through SSM.
 - To pause costs, stop the instance in the EC2 console (the Elastic IP still costs ~$3.60/month); `docker compose` services restart with it.
 - The instance image is pinned in `infra/ec2.yaml` (`ImageId`), so `infra` updates don't replace the instance.
-  Changing `ImageId` would, and it takes the Postgres and n8n data with it, so back up first.
+  Changing `ImageId` would, and it takes the Postgres and n8n data with it (see "Replace the instance" in section 10).
+- Section 10 covers every other situation: pausing, backups, restores, teardown and failures.
 
 ### 8. Call records and dashboard
 The bot saves calls, turns, tool calls and bookings to Postgres (`db`, schema in `db/10-schema.sql`) as they happen.
@@ -164,6 +165,58 @@ and push. Pushes to `main` then run `scripts/deploy-server.sh release` and smoke
 - Every release re-applies `db/10-schema.sql`, so keep it idempotent (new columns also go in its
   `ADD COLUMN IF NOT EXISTS` section).
 - A release restarts the bot, which drops any call in progress.
+
+### 10. Server runbook
+Every command is `scripts/deploy-server.sh <command>`, run from a machine with Docker, the filled-in `.env` and
+AWS credentials in `~/.aws` (`aws login`). Commands that delete or replace data ask you to type `voice-agent` first.
+
+**First setup, empty account:** `up` (about 20 min).
+- Before it: the GitHub OIDC provider must exist in the account (the CI role trusts it). Once per account:
+  `aws iam create-open-id-connect-provider --url https://token.actions.githubusercontent.com --client-id-list sts.amazonaws.com`.
+- Also before it: Bedrock model access for the model in `BEDROCK_MODEL` (console), the `voice-agent` Cloudflare tunnel
+  (its token in `.env`), and `gh auth login` so `up` can set the `AWS_DEPLOY_ROLE_ARN` repo variable.
+- After it: point the Meta webhook at `https://voice-agent.njmtech.co.za/whatsapp` if it isn't already.
+- The first `infra` failed and the stack is in `ROLLBACK_COMPLETE`: `SKIP_BACKUP=1 scripts/deploy-server.sh down`, then `up`.
+- It stopped halfway: run `up` again. Every step is safe to repeat (n8n's owner setup prints an "already set up" error, which is fine).
+
+**Existing server, first time on a version with `backup`:** run `infra` once. It lets the instance write
+`backups/` in the deploy bucket; it's a permissions change only and doesn't touch the instance.
+
+**Ship code:** push to `main` (CI runs `release`), or run `release` from here.
+
+**Change secrets or settings in `.env`:** `app` (stores the `.env` in SSM, then releases). `env` alone stores it for the next release.
+
+**Change the infrastructure:** edit `infra/ec2.yaml` and run `infra`, or `infra/github-ci.yaml` and run `ci`.
+Check first that the change doesn't replace the instance (see "Replace the instance").
+
+**Look at the server:** `run '<command>'`, e.g. `run 'docker compose ps'` or `run 'docker compose logs --tail 100 agent'`.
+
+**Back up:** `backup` writes `.deploy/backups/voice-db-<UTC time>.sql.gz` (git-ignored, so copy it somewhere safe
+for keeping). It holds the call records and bookings. Not included: Metabase's own database (the dashboard is
+recreated by `metabase-setup.py`) and n8n's data (the workflows are in `n8n-workflows/`; credentials and execution
+history are not). A copy also sits in the deploy bucket under `backups/` for 14 days.
+
+**Restore:** `restore` loads the newest file in `.deploy/backups/`; `restore <file>` loads that one.
+- It replaces the database. The bot is stopped meanwhile (calls in progress drop) and started again however it ends.
+- It runs as one transaction, so a failed restore leaves the database as it was.
+- Older backups are fine: the current schema and the dashboard role's grants are re-applied afterwards.
+
+**Pause costs:** stop the instance in the EC2 console; start it again to resume (the services start with it).
+While stopped, the Elastic IP still costs about $3.60/month, and pushes to `main` fail the deploy job (SSM can't
+reach the instance). For no costs at all, tear it down instead.
+
+**Tear down:** `down` backs up the database, then deletes both stacks (instance and disk, Elastic IP, roles,
+security group, deploy bucket), the `/voice-agent/env` parameter and the `AWS_DEPLOY_ROLE_ARN` variable, so pushes
+to `main` skip the deploy job. Kept: the GitHub OIDC provider (shared with other repos), Bedrock model access,
+the Cloudflare tunnel and DNS records, and your local `.env` and backups.
+- The backup failed: nothing was deleted. Fix it, or delete without one: `SKIP_BACKUP=1 scripts/deploy-server.sh down`.
+- The instance is stopped: start it first to keep the data, or use `SKIP_BACKUP=1` to give it up.
+- A stack ended in `DELETE_FAILED`: check its events in the CloudFormation console, then run `down` again.
+
+**Bring it back after a teardown:** `up`, then `restore`. The new Elastic IP needs no config (the bot finds it over STUN).
+
+**Replace the instance** (a new `ImageId`, a bigger disk, or a broken server): `backup`, make the change, `up`, `restore`.
+`up` re-runs every setup step on the new instance and points the CI role at it. For a broken server, `down` then `up`, `restore` does the same.
 
 ## Latency notes
 - **Target:** about 1.5–2 s from the end of the caller's speech to the bot's first audio.

@@ -111,9 +111,11 @@ case ${1:-} in
     fi
     param=/voice-agent/env
     if aws cloudformation describe-stacks --stack-name "$STACK" >/dev/null 2>&1; then
-      param=$(output EnvParameterName)
+      # A stack whose first create failed has no outputs (and maybe no bucket).
+      param=$(output EnvParameterName); param=${param:-/voice-agent/env}
+      bucket=$(output DeployBucket)
       # CloudFormation can't delete a bucket that still has objects in it.
-      aws s3 rm "s3://$(output DeployBucket)" --recursive
+      if [ -n "$bucket" ]; then aws s3 rm "s3://$bucket" --recursive; fi
       aws cloudformation delete-stack --stack-name "$STACK"
       aws cloudformation wait stack-delete-complete --stack-name "$STACK"
       echo "Deleted stack $STACK"

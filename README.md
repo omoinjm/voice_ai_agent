@@ -132,6 +132,11 @@ openwa can't take calls; they come through Meta's official Calling API. Pipecat 
 ### 7. Deploy to AWS (EC2, us-east-1)
 The server runs the same compose stack (`agent`, `n8n`, `cloudflared`); only its `.env` differs (`LLM_PROVIDER=bedrock`, `PIPECAT_ICE_SERVERS` STUN so WebRTC peers get the Elastic IP). WhatsApp voice notes stay local, because the openwa gateway belongs to the carwash project.
 ```bash
+scripts/deploy-server.sh up          # everything below in one go, from an empty account (~20 min)
+scripts/deploy-server.sh down        # back up Postgres, then delete it all: both stacks, the bucket, the .env parameter (asks first)
+scripts/deploy-server.sh backup      # pg_dump the server's database to .deploy/backups/ (git-ignored)
+scripts/deploy-server.sh restore     # load the newest backup (or a given file) into the server's database, e.g. after `up`
+
 scripts/deploy-server.sh infra       # c7i-flex.large + Elastic IP + role + deploy bucket (~$34/month while running)
 scripts/deploy-server.sh app         # upload the repo + .env, build and start on the server (first build ~10 min)
 scripts/deploy-server.sh n8n-setup   # first deploy only: n8n owner, tool + post-call workflows

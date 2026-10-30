@@ -67,6 +67,10 @@ Resources:
               - Effect: Allow
                 Action: s3:GetObject
                 Resource: !Sub ${DeployBucket.Arn}/*
+              # Database backups (`deploy-server.sh backup`, also run before `down`); downloaded from there.
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub ${DeployBucket.Arn}/backups/*
               - Effect: Allow
                 Action: ssm:GetParameter
                 Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${EnvParameterName}

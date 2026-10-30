@@ -47,7 +47,8 @@ jobs:
 
   deploy:
     needs: checks
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # Skipped while the AWS stack is down (`deploy-server.sh down` removes the variable).
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.AWS_DEPLOY_ROLE_ARN != ''
     runs-on: ubuntu-24.04
     # One deploy at a time; a newer push waits rather than cancelling a deploy halfway.
     concurrency:

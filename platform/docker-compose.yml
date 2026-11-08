@@ -1,0 +1,75 @@
+# Local development stack for the SaaS platform (separate from the single-tenant ../docker-compose.yml, which
+# still runs the live server until cutover).
+#   docker compose -f platform/docker-compose.yml up -d --build
+#   API: http://localhost:8100/docs   Web: http://localhost:3100
+# Auth is in dev mode: send `Authorization: Bearer dev:you@example.com` (add `:admin` for a platform admin).
+name: voice-platform
+
+services:
+  db:
+    image: pgvector/pgvector:pg17
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5434:5432"
+    environment:
+      - POSTGRES_USER=platform
+      - POSTGRES_PASSWORD=platform
+      - POSTGRES_DB=platform
+    volumes:
+      - db_data:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "platform"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  api:
+    build:
+      context: ./api
+      additional_contexts:
+        uvcache: ${HOME}/.cache/uv
+      args:
+        HOST_UV_CACHE: ${HOME}/.cache/uv
+        INSTALL_DEV: "1"
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8100:8000"
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://platform:platform@db:5432/platform
+      - ENVIRONMENT=local
+      - AUTH_MODE=dev
+      - CORS_ORIGINS=["http://localhost:3100"]
+      - AWS_REGION=us-east-1
+    volumes:
+      # Live code for --reload; the venv stays in the image.
+      - ./api/app:/app/app
+      - ./api/migrations:/app/migrations
+      - ./api/tests:/app/tests
+    command: ["sh", "-c", "alembic upgrade head && exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"]
+    depends_on:
+      db:
+        condition: service_healthy
+
+  # Next.js dev server with hot reload. node_modules lives in a volume so the host never needs npm.
+  web:
+    image: node:22-alpine
+    restart: unless-stopped
+    working_dir: /app
+    ports:
+      - "127.0.0.1:3100:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:8100
+      - NEXT_PUBLIC_AUTH_MODE=dev
+      - NEXT_TELEMETRY_DISABLED=1
+      - WATCHPACK_POLLING=true
+    volumes:
+      - ./web:/app
+      - web_node_modules:/app/node_modules
+    command: ["sh", "-c", "npm ci && exec npm run dev -- --hostname 0.0.0.0 --port 3000"]
+    depends_on:
+      - api
+
+volumes:
+  db_data:
+  web_node_modules:

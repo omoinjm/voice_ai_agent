@@ -19,7 +19,8 @@ This repo holds two things:
 | `infra/aws/` | CloudFormation: the platform's shared core (`platform-core.yaml`) and one stack per tenant environment (`tenant.yaml`), and the GitHub Actions deploy role (`github-ci.yaml`) |
 | `infra/local/` | Local-only setup, such as the platform database's init scripts |
 | `legacy/` | The live single-business server: `compose.yaml`, `deploy-server.sh`, `ec2.yaml`, `metabase-setup.py`, Postgres schema (`db/`), n8n workflows (`n8n-workflows/`), prompt and tool list (`shared/`) |
-| `compose.yaml` | Local platform stack: `docker compose up -d --build`, then the app on http://localhost:3100 and the API on http://localhost:8100/docs |
+| `compose.yaml` | Local platform stack: `docker compose up -d --build`, then the app on http://localhost:3100 and the API on http://localhost:8100/docs. `--profile agent` adds the voice agent in tenant mode as a local "demo" tenant (http://localhost:7870; tests: `docker compose --profile agent run --rm agent pytest`) |
+| `infra/secrets.md` | Every secret the platform needs, where to get it and where it goes (kept in Infisical) |
 | `.github/workflows/ci-cd.yml` | Checks on every push and PR; deploys `main` to the live server |
 
 ## Platform on AWS (`infra/aws/platform-core.yaml`)

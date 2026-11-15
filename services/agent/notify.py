@@ -27,9 +27,8 @@ def booking_status(booking: dict) -> str:
     return "Rescheduled" if booking.get("rescheduled_at") else "Confirmed"
 
 
-def booking_message(bookings: list[dict]) -> str:
+def booking_message(bookings: list[dict], business: str) -> str:
     """One message covering every booking made, moved or cancelled on the call."""
-    business = os.getenv("BUSINESS_NAME", "Demo Co")
     lines = [f"Hi {bookings[0]['name']}, thanks for calling {business}. "
              f"Here's {'an update on your bookings' if len(bookings) > 1 else 'your booking'}:"]
     for b in bookings:

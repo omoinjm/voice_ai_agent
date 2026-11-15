@@ -1,4 +1,8 @@
-"""Real-time voice agent: Deepgram STT -> LLM (tools via n8n) -> TTS.
+"""Real-time voice agent: Deepgram STT -> LLM (with tools) -> TTS.
+
+Runs for one business. On the platform (TENANT_ID set) the business, persona, voice and tools come from the tenant's
+published agent config and its own database schema; on the live Demo Co server (legacy mode) from legacy/shared/
+and n8n. See agent_config.py.
 
 The LLM is Claude on Amazon Bedrock by default; LLM_PROVIDER=cloudflare (Workers AI GPT-OSS-120B) or
 anthropic (Claude API) are fallbacks (see llm.py).
@@ -15,8 +19,6 @@ import json
 import os
 import uuid
 from datetime import UTC, datetime
-from zoneinfo import ZoneInfo
-from pathlib import Path
 
 import aiohttp
 from dotenv import load_dotenv
@@ -38,10 +40,22 @@ from pipecat.services.deepgram.tts import DeepgramTTSService
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.workers.runner import WorkerRunner
 
+import task_protection
+from agent_config import SHARED_DIR, AgentConfig, get_config
 from llm import make_llm
 from notify import booking_message, send_whatsapp_text
 from notify import spoken_time
-from tools import BOOKING_TOOLS, load_tools, register_booking_tools, register_n8n_tools, run_n8n_tool, tools_schema
+from tools import (
+    BOOKING_TOOLS,
+    business_info_answer,
+    business_tools,
+    load_tools,
+    register_booking_tools,
+    register_n8n_tools,
+    register_tenant_tools,
+    run_n8n_tool,
+    tools_schema,
+)
 from cloudflare_tts import CloudflareTTSService
 from speech_text import SpeechTextFilter
 from store import CallStore
@@ -49,8 +63,11 @@ from voxcpm_tts import VoxCPMTTSService
 
 load_dotenv(override=True)
 
-# /shared in Docker; the repo's legacy/shared/ folder when run from services/agent/ locally.
-SHARED_DIR = Path(os.environ.get("SHARED_DIR") or Path(__file__).resolve().parents[2] / "legacy" / "shared")
+
+async def fetch_business_info(config: AgentConfig, session: aiohttp.ClientSession, caller: dict) -> dict:
+    if config.tenant_mode:
+        return business_info_answer(config.business_info, "all")
+    return await run_n8n_tool(session, "get_business_info", {"topic": "all"}, caller)
 
 
 def caller_info(runner_args: RunnerArguments) -> dict:
@@ -72,6 +89,7 @@ async def post_call(session: aiohttp.ClientSession, call: dict):
 
 
 async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> None:
+    config = await get_config()
     caller = caller_info(runner_args)
     call_id = runner_args.session_id or str(uuid.uuid4())
     started_at = datetime.now(UTC)
@@ -81,7 +99,9 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
     await store.connect()
     await store.start_call(call_id, caller["channel"], caller.get("phone"), started_at)
     # A number's first call of the day hears the services and prices; later calls go straight to booking.
-    returning = bool(caller.get("phone")) and await store.earlier_calls_today(caller["phone"], call_id) > 0
+    returning = bool(caller.get("phone")) and await store.earlier_calls_today(
+        caller["phone"], call_id, config.timezone
+    ) > 0
     # Upcoming bookings take priority: the caller is asked whether to reschedule or cancel them.
     active = await store.active_bookings(caller["phone"]) if caller.get("phone") else []
     logger.info(f"{'Returning' if returning else 'First'} caller today, {len(active)} active booking(s)")
@@ -89,18 +109,17 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
     async with aiohttp.ClientSession() as session:
         # Fetched while the call connects, so the greeting can include them without a tool round trip.
         business_info = None if returning or active else asyncio.create_task(
-            run_n8n_tool(session, "get_business_info", {"topic": "all"}, caller)
+            fetch_business_info(config, session, caller)
         )
-        tts_provider = os.getenv("TTS_PROVIDER", "deepgram")
-        if tts_provider == "deepgram":
+        if config.tts_provider == "deepgram":
             # Aura-2 streamed over a WebSocket: audio starts ~0.2 s after the first sentence arrives.
             tts = DeepgramTTSService(
                 api_key=os.environ["DEEPGRAM_API_KEY"],
-                settings=DeepgramTTSService.Settings(voice=os.getenv("DEEPGRAM_TTS_VOICE", "aura-2-asteria-en")),
+                settings=DeepgramTTSService.Settings(voice=config.tts_voice or "aura-2-asteria-en"),
                 text_filters=[SpeechTextFilter()],
             )
             warmup = asyncio.create_task(asyncio.sleep(0))
-        elif tts_provider == "voxcpm":
+        elif config.tts_provider == "voxcpm":
             tts = VoxCPMTTSService(
                 base_url=os.environ["VOXCPM_URL"], token=os.environ["VOXCPM_TOKEN"], aiohttp_session=session
             )
@@ -135,10 +154,11 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
             stt = DeepgramSTTService(api_key=os.getenv("DEEPGRAM_API_KEY"))
             user_params = LLMUserAggregatorParams(vad_analyzer=SileroVADAnalyzer())
 
-        system = (SHARED_DIR / "system.md").read_text()
+        system = config.system_prompt
         # Without today's date the model guesses one (it booked "Friday" in June 2024).
-        now = datetime.now(ZoneInfo("Africa/Johannesburg"))
-        system += f"\nIt is now {now:%A %-d %B %Y, %H:%M} in South Africa. Work out dates such as \"Friday\" from this."
+        now = datetime.now(config.tz)
+        system += (f"\nIt is now {now:%A %-d %B %Y, %H:%M} ({config.timezone} time). "
+                   "Work out dates such as \"Friday\" from this.")
         if caller.get("phone"):
             system += f"\nThis is a WhatsApp call. The caller's WhatsApp number is {caller['phone']}."
         if active:
@@ -147,9 +167,13 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
             )
             system += (f"\nThe caller has these active bookings: {listed}. Use reschedule_booking or cancel_booking "
                        "to change them.")
-        llm = make_llm(system)
-        tools = load_tools(SHARED_DIR)
-        register_n8n_tools(llm, tools, session, caller, store, call_id)
+        llm = make_llm(system, config.llm_model)
+        if config.tenant_mode:
+            tools = business_tools(config)
+            register_tenant_tools(llm, config, caller, store, call_id)
+        else:
+            tools = load_tools(SHARED_DIR)
+            register_n8n_tools(llm, tools, session, caller, store, call_id)
         register_booking_tools(llm, caller, store, call_id)
 
         context = LLMContext(tools=tools_schema(tools + BOOKING_TOOLS))
@@ -234,29 +258,35 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
             logger.info("Client disconnected")
             await runner.cancel()
 
+        await task_protection.call_started(session)
         try:
             await runner.run()
         finally:
+            await task_protection.call_ended(session)
             ended_at = datetime.now(UTC)
             await store.end_call(call_id, ended_at)
             # Bookings made on a WhatsApp call get a confirmation message to the caller's WhatsApp.
             if caller.get("phone"):
                 bookings = await store.unconfirmed_bookings(call_id, caller["phone"])
-                if bookings and await send_whatsapp_text(session, caller["phone"], booking_message(bookings)):
+                message = booking_message(bookings, config.business_name) if bookings else None
+                if message and await send_whatsapp_text(session, caller["phone"], message):
                     await store.mark_confirmed([b["reference"] for b in bookings])
             await store.close()
-            transcript = [
-                {"role": m["role"], "content": m["content"]}
-                for m in context.get_messages()
-                if isinstance(m, dict) and m.get("role") in ("user", "assistant") and isinstance(m.get("content"), str)
-            ]
-            await post_call(session, {
-                "callId": call_id,
-                **caller,
-                "startedAt": started_at.isoformat(),
-                "endedAt": ended_at.isoformat(),
-                "transcript": transcript,
-            })
+            # n8n's post-call flow is legacy only; on the platform the turns are already in the tenant schema.
+            if not config.tenant_mode:
+                transcript = [
+                    {"role": m["role"], "content": m["content"]}
+                    for m in context.get_messages()
+                    if isinstance(m, dict) and m.get("role") in ("user", "assistant")
+                    and isinstance(m.get("content"), str)
+                ]
+                await post_call(session, {
+                    "callId": call_id,
+                    **caller,
+                    "startedAt": started_at.isoformat(),
+                    "endedAt": ended_at.isoformat(),
+                    "transcript": transcript,
+                })
 
 
 async def bot(runner_args: RunnerArguments):
@@ -271,4 +301,7 @@ async def bot(runner_args: RunnerArguments):
 if __name__ == "__main__":
     from pipecat.runner.run import main
 
+    # Load (and validate) the agent config before taking calls: on the platform a missing or broken config stops the
+    # task here, so ECS rolls the deployment back instead of answering calls with the wrong business.
+    asyncio.run(get_config())
     main()

@@ -48,7 +48,8 @@ services:
       - ./services/api/app:/app/app
       - ./services/api/migrations:/app/migrations
       - ./services/api/tests:/app/tests
-    command: ["sh", "-c", "alembic upgrade head && exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"]
+    # dev_tenant: a "demo" tenant schema + agent config for the `agent` service (stands in for provisioning).
+    command: ["sh", "-c", "alembic upgrade head && python -m app.dev_tenant && exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"]
     depends_on:
       db:
         condition: service_healthy
@@ -71,6 +72,39 @@ services:
     command: ["sh", "-c", "npm ci && exec npm run dev -- --hostname 0.0.0.0 --port 3000"]
     depends_on:
       - api
+
+  # The voice agent in tenant mode, as the "demo" tenant's staging environment (seeded by the api service).
+  # Opt-in: docker compose --profile agent up -d --build agent, then http://localhost:7870 for a browser call
+  # (needs DEEPGRAM_API_KEY in the environment and AWS credentials in ~/.aws for Bedrock).
+  # Tests: docker compose --profile agent run --rm agent pytest
+  agent:
+    profiles: [agent]
+    build:
+      context: ./services/agent
+      additional_contexts:
+        uvcache: ${HOME}/.cache/uv
+      args:
+        HOST_UV_CACHE: ${HOME}/.cache/uv
+        INSTALL_DEV: "1"
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:7870:7860"
+    environment:
+      - TENANT_ID=00000000-0000-4000-8000-000000000001
+      - TENANT_SLUG=demo
+      - TENANT_ENV=staging
+      - CONFIG_VERSION=1
+      - DATABASE_URL=postgresql://t_demo_staging:localdemotenantpassword1@db:5432/platform
+      - AWS_REGION=us-east-1
+      - DEEPGRAM_API_KEY=${DEEPGRAM_API_KEY:-}
+    volumes:
+      - ./services/agent:/app/src:ro
+      - ${HOME}/.aws:/root/.aws:ro
+    working_dir: /app/src
+    command: ["python", "bot.py", "-t", "webrtc", "--host", "0.0.0.0", "--port", "7860"]
+    depends_on:
+      api:
+        condition: service_started
 
 volumes:
   db_data:

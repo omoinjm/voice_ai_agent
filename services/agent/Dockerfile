@@ -10,12 +10,15 @@ COPY pyproject.toml uv.lock ./
 # `uv pip install` (`uv sync` keys locked wheels differently and misses the host cache); if something
 # isn't cached, fall back to an online `uv sync` with long timeouts and retries.
 ARG HOST_UV_CACHE=/root/.cache/uv
+# INSTALL_DEV=1 adds pytest (local compose and CI); the deployed image leaves it out.
+ARG INSTALL_DEV=0
 ENV UV_HTTP_TIMEOUT=600 UV_CONCURRENT_DOWNLOADS=4 UV_LINK_MODE=copy
 RUN --mount=type=bind,from=uvcache,target=${HOST_UV_CACHE},rw \
     export UV_CACHE_DIR=${HOST_UV_CACHE}; \
-    uv export --frozen --no-dev --no-hashes --no-emit-project -o /tmp/requirements.txt \
+    if [ "$INSTALL_DEV" = 1 ]; then DEV=""; else DEV="--no-dev"; fi; \
+    uv export --frozen $DEV --no-hashes --no-emit-project -o /tmp/requirements.txt \
     && uv venv && uv pip install --offline -r /tmp/requirements.txt && exit 0; \
-    for i in 1 2 3 4 5; do uv sync --frozen --no-dev && exit 0; echo "uv sync attempt $i failed, retrying"; sleep 5; done; exit 1
+    for i in 1 2 3 4 5; do uv sync --frozen $DEV && exit 0; echo "uv sync attempt $i failed, retrying"; sleep 5; done; exit 1
 COPY *.py ./
 ENV SHARED_DIR=/shared PATH="/app/.venv/bin:$PATH"
 EXPOSE 7860

@@ -174,10 +174,10 @@ Resources:
           Environment:
             - { Name: TENANT_ID, Value: !Ref TenantId }
             - { Name: TENANT_SLUG, Value: !Ref TenantSlug }
-            - { Name: ENV, Value: !Ref Environment }
+            - { Name: TENANT_ENV, Value: !Ref Environment }   # not ENV: Pipecat's runner overwrites that
             - { Name: CONFIG_VERSION, Value: !Ref ConfigVersion }
             - { Name: AWS_REGION, Value: !Ref AWS::Region }
-            - { Name: STUN_URL, Value: !Ref StunUrl }
+            - { Name: PIPECAT_ICE_SERVERS, Value: !Ref StunUrl }   # read by Pipecat's runner
             - Name: VOICES_BUCKET
               Value:
                 Fn::ImportValue: !Sub "${PlatformStackName}-VoicesBucket"

@@ -1,7 +1,10 @@
-"""LLM tools: n8n-backed business tools, plus booking changes run against the call store.
+"""LLM tools: the business tools (business info, new bookings), plus booking changes run against the call store.
 
-Tool schemas live in legacy/shared/tools.json (Anthropic format) so the WhatsApp voice-note flow in n8n
-and this bot offer the same tools. Every tool is executed by POSTing
+Tenant mode (platform): the business tools run here, answering from the agent config and writing bookings to the
+tenant's database (register_tenant_tools).
+
+Legacy mode (the live Demo Co server): tool schemas live in legacy/shared/tools.json (Anthropic format) so the
+WhatsApp voice-note flow in n8n and this bot offer the same tools. Every tool is executed by POSTing
 `{tool, input, channel, phone}` to `$N8N_URL/webhook/tool` and handing the JSON response back to Claude.
 """
 
@@ -15,6 +18,7 @@ from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.services.llm_service import FunctionCallParams, LLMService
 
+from agent_config import AgentConfig
 from store import CallStore
 
 
@@ -126,3 +130,80 @@ def register_booking_tools(llm: LLMService, caller: dict, store: CallStore, call
 
     for t in BOOKING_TOOLS:
         llm.register_function(t["name"], change_booking)
+
+
+# Tenant mode: the business tools, run here against the agent config and the tenant's database (no n8n).
+BUSINESS_INFO_TOPICS = ["hours", "address", "services", "prices", "all"]
+
+
+def business_tools(config: AgentConfig) -> list[dict]:
+    """Same names and arguments as legacy/shared/tools.json, worded for this business."""
+    return [
+        {
+            "name": "get_business_info",
+            "description": f"Look up {config.business_name}'s opening hours, address, services and prices. "
+                           "Call this before answering any question about the business.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "topic": {"type": "string", "enum": BUSINESS_INFO_TOPICS,
+                              "description": "What the caller is asking about."},
+                },
+                "required": ["topic"],
+            },
+        },
+        {
+            "name": "create_booking",
+            "description": "Book an appointment once you have the caller's name, the service and a preferred date "
+                           "and time. Confirm the details with the caller before calling this.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Caller's full name."},
+                    "service": {"type": "string", "description": "The service being booked."},
+                    "datetime": {"type": "string",
+                                 "description": f"Requested date and time, ISO 8601 in {config.timezone} time."},
+                    "phone": {"type": "string", "description": "Caller's phone number if known."},
+                },
+                "required": ["name", "service", "datetime"],
+            },
+        },
+    ]
+
+
+def business_info_answer(info: dict, topic: str | None) -> dict:
+    """The part of the business info that answers `topic`; everything when the topic is 'all', unknown or missing
+    from the info, so the model can still answer."""
+    key = "services" if topic == "prices" else topic
+    if key and key != "all" and key in info:
+        return {key: info[key]}
+    return dict(info)
+
+
+def register_tenant_tools(llm: LLMService, config: AgentConfig, caller: dict, store: CallStore, call_id: str):
+    """get_business_info answers from the config; create_booking writes the booking straight to the call store."""
+
+    async def get_business_info(params: FunctionCallParams):
+        args = dict(params.arguments)
+        result = business_info_answer(config.business_info or {}, args.get("topic"))
+        await params.result_callback(result)
+        await store.add_tool_call(call_id, params.function_name, args, result)
+
+    async def create_booking(params: FunctionCallParams):
+        args = dict(params.arguments)
+        missing = [field for field in ("name", "service", "datetime") if not str(args.get(field) or "").strip()]
+        if missing:
+            result = {"ok": False, "error": f"Missing {', '.join(missing)}."}
+        else:
+            # The calling WhatsApp number owns the booking (so the caller can change it later), over what was said.
+            booking = {**args, "phone": caller.get("phone") or args.get("phone")}
+            try:
+                result = {"ok": True, "reference": await store.create_booking(call_id, booking)}
+            except Exception as e:
+                logger.error(f"Tool {params.function_name} failed: {e}")
+                result = {"ok": False, "error": "Bookings can't be made right now."}
+        await params.result_callback(result)
+        await store.add_tool_call(call_id, params.function_name, args, result)
+
+    llm.register_function("get_business_info", get_business_info)
+    llm.register_function("create_booking", create_booking)

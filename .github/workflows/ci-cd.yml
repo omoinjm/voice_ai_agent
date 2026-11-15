@@ -61,6 +61,12 @@ jobs:
           docker compose up -d --wait db
           docker compose run --rm --no-deps api sh -c "ruff check . && ruff format --check . && pytest -q"
 
+      - name: Agent tests (tenant mode, against the local demo tenant)
+        run: |
+          docker compose --profile agent build agent
+          docker compose run --rm --no-deps api sh -c "alembic upgrade head && python -m app.dev_tenant"
+          docker compose --profile agent run --rm --no-deps agent pytest -q
+
       - name: App lint, typecheck and build
         run: |
           docker run --rm -v "$PWD/apps/app:/app" -w /app -e NEXT_TELEMETRY_DISABLED=1 node:22-alpine \

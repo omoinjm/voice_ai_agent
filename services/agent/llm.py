@@ -15,10 +15,11 @@ from pipecat.services.llm_service import LLMService
 from cloudflare_llm import CloudflareLLMService
 
 
-def make_llm(system: str) -> LLMService:
+def make_llm(system: str, bedrock_model: str | None = None) -> LLMService:
+    """`bedrock_model` (from a tenant's agent config) overrides BEDROCK_MODEL."""
     provider = os.getenv("LLM_PROVIDER", "bedrock")
     if provider == "bedrock":
-        model = os.getenv("BEDROCK_MODEL", "us.anthropic.claude-haiku-4-5-20251001-v1:0")
+        model = bedrock_model or os.getenv("BEDROCK_MODEL", "us.anthropic.claude-haiku-4-5-20251001-v1:0")
         return AWSBedrockLLMService(
             aws_region=os.getenv("AWS_REGION", "us-east-1"),
             settings=AWSBedrockLLMService.Settings(

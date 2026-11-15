@@ -1,4 +1,5 @@
-"""Saves calls to Postgres while they happen (schema: legacy/db/10-schema.sql).
+"""Saves calls to Postgres while they happen (schema: legacy/db/10-schema.sql on the live server; on the platform,
+the tenant schema from services/api/app/tenant_schema.py, which the tenant role's search_path points at).
 
 Every write is best-effort: a database problem is logged and never interrupts a live call.
 Without DATABASE_URL the store does nothing, so the bot still runs on its own.
@@ -6,6 +7,7 @@ Without DATABASE_URL the store does nothing, so the bot still runs on its own.
 
 import json
 import os
+import secrets
 from datetime import UTC, datetime
 
 import asyncpg
@@ -14,6 +16,15 @@ from loguru import logger
 # A booking belongs to a number if it was booked for that number or made on a call from it ($2 = phone).
 _BOOKINGS = "bookings b LEFT JOIN calls c ON c.id = b.call_id"
 _OWNED_BY = "(b.phone = $2 OR c.phone = $2)"
+
+
+# References are read aloud and typed back, so no look-alikes (0/O, 1/I).
+_REFERENCE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+
+
+def new_reference() -> str:
+    """'BK' + 5 characters, e.g. BKC6HY8 (the same shape n8n used for the live server's bookings)."""
+    return "BK" + "".join(secrets.choice(_REFERENCE_ALPHABET) for _ in range(5))
 
 
 def _is_upcoming(requested: str, now: datetime) -> bool:
@@ -53,16 +64,15 @@ class CallStore:
             call_id, channel, phone, started_at,
         )
 
-    async def earlier_calls_today(self, phone: str, call_id: str) -> int:
-        """Calls from this number earlier today (South African time), not counting `call_id`."""
+    async def earlier_calls_today(self, phone: str, call_id: str, timezone: str) -> int:
+        """Calls from this number earlier today (in the business's time zone), not counting `call_id`."""
         if not self._pool:
             return 0
         try:
             return await self._pool.fetchval(
                 "SELECT count(*) FROM calls WHERE phone = $1 AND id <> $2"
-                " AND started_at >= date_trunc('day', now() AT TIME ZONE 'Africa/Johannesburg')"
-                " AT TIME ZONE 'Africa/Johannesburg'",
-                phone, call_id,
+                " AND started_at >= date_trunc('day', now() AT TIME ZONE $3) AT TIME ZONE $3",
+                phone, call_id, timezone,
             )
         except Exception as e:
             logger.error(f"Call store read failed: {e}")
@@ -141,6 +151,22 @@ class CallStore:
             reference, call_id, booking.get("name"), booking.get("service"), booking.get("datetime"),
             booking.get("phone"),
         )
+
+    async def create_booking(self, call_id: str, booking: dict) -> str:
+        """Save a new booking under a fresh reference and return the reference (tenant mode, where there's no n8n to
+        hand one out). Raises if the database is unavailable."""
+        if not self._pool:
+            raise RuntimeError("call store unavailable")
+        for _ in range(5):
+            reference = await self._pool.fetchval(
+                "INSERT INTO bookings (reference, call_id, name, service, requested, phone)"
+                " VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (reference) DO NOTHING RETURNING reference",
+                new_reference(), call_id, booking["name"], booking["service"], booking["datetime"],
+                booking.get("phone"),
+            )
+            if reference:
+                return reference
+        raise RuntimeError("couldn't find a free booking reference")
 
     async def close(self):
         if self._pool:

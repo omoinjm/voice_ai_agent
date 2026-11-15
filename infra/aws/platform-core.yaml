@@ -1,0 +1,955 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Voice agent SaaS platform, shared core: VPC, ECS cluster + Cloud Map, RDS Postgres 17 (pgvector), S3 for
+  documents and voice samples, Cognito, ECR, SES/SNS, and the control-plane services (web app, API) reached
+  through a Cloudflare tunnel. Each tenant environment is a separate tenant.yaml stack that imports the exports
+  below. The router, Step Functions provisioning and workers are added in later milestones.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: Domain and auth }
+        Parameters: [DomainName, AuthDomainPrefix, AllowLocalhostCallbacks]
+      - Label: { default: Database }
+        Parameters: [DbInstanceClass, DbAllocatedStorage, DbDeletionProtection]
+      - Label: { default: Services (keep at 0 until images are pushed and the tunnel token is set) }
+        Parameters: [ApiImageTag, AppImageTag, ApiDesiredCount, AppDesiredCount, TunnelDesiredCount]
+      - Label: { default: Alerts }
+        Parameters: [AlertEmail]
+
+Parameters:
+  DomainName:
+    Type: String
+    Description: Product domain (DNS in Cloudflare). Hosts used are app.<domain>, api.<domain>, calls.<domain>.
+    AllowedPattern: ^[a-z0-9.-]+\.[a-z]{2,}$
+  AuthDomainPrefix:
+    Type: String
+    Description: Cognito login domain prefix, unique in the region (<prefix>.auth.<region>.amazoncognito.com).
+    AllowedPattern: ^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$
+  AllowLocalhostCallbacks:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "false"
+    Description: Also allow http://localhost:3100 as a Cognito redirect (local app against real Cognito).
+  DbInstanceClass:
+    Type: String
+    Default: db.t4g.micro
+  DbAllocatedStorage:
+    Type: Number
+    Default: 20
+    MinValue: 20
+  DbDeletionProtection:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "true"
+  ApiImageTag:
+    Type: String
+    Default: unset
+    Description: Tag in the api ECR repository (tags are immutable; deploy a new tag to release).
+  AppImageTag:
+    Type: String
+    Default: unset
+    Description: Tag in the app ECR repository. The image is built per environment (NEXT_PUBLIC_* build args).
+  ApiDesiredCount:
+    Type: Number
+    Default: 0
+    MinValue: 0
+  AppDesiredCount:
+    Type: Number
+    Default: 0
+    MinValue: 0
+  TunnelDesiredCount:
+    Type: Number
+    Default: 0
+    MinValue: 0
+  AlertEmail:
+    Type: String
+    Default: ""
+    Description: Optional address subscribed to the alerts topic (confirm the email AWS sends).
+
+Conditions:
+  LocalhostCallbacks: !Equals [!Ref AllowLocalhostCallbacks, "true"]
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, ""]]
+
+Resources:
+  # ---------------------------------------------------------------- network
+  # Two AZs. Tasks run in the public subnets with public IPs (tenant agents need them for WebRTC media, and it
+  # avoids a NAT gateway); nothing listens publicly except agents' UDP media. RDS sits in private subnets with
+  # no route out.
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.40.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{ Key: Name, Value: !Ref AWS::StackName }]
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags: [{ Key: Name, Value: !Ref AWS::StackName }]
+
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.40.0.0/20
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-public-a" }]
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.40.16.0/20
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-public-b" }]
+
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.40.128.0/22
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-private-a" }]
+
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.40.132.0/22
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-private-b" }]
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-public" }]
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetARoutes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetBRoutes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-private" }]
+
+  PrivateSubnetARoutes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetA
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnetBRoutes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetB
+      RouteTableId: !Ref PrivateRouteTable
+
+  # ---------------------------------------------------------------- security groups
+  TunnelSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: cloudflared - outbound only
+      VpcId: !Ref Vpc
+
+  ApiSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Control-plane API - from the tunnel only
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8000
+          ToPort: 8000
+          SourceSecurityGroupId: !Ref TunnelSecurityGroup
+
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Web app - from the tunnel only
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3000
+          ToPort: 3000
+          SourceSecurityGroupId: !Ref TunnelSecurityGroup
+
+  # Shared by every tenant agent task (tenant.yaml). aiortc picks random UDP ports for each call's media.
+  # Signalling ingress from the router is added with the router.
+  AgentSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Tenant agents - WebRTC media
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: udp
+          FromPort: 1024
+          ToPort: 65535
+          CidrIp: 0.0.0.0/0
+
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Postgres - from the API and tenant agents
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref ApiSecurityGroup
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref AgentSecurityGroup
+
+  # ---------------------------------------------------------------- database
+  # Our own secret (not RDS-managed) so the password doesn't rotate under running tasks, which only read
+  # secrets at start. No punctuation: the API builds a postgres URL from it.
+  DatabaseSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${AWS::StackName}/db-master"
+      Description: Master credentials for the platform database
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "platform"}'
+        GenerateStringKey: password
+        PasswordLength: 32
+        ExcludePunctuation: true
+
+  DatabaseSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Platform database (private subnets)
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+
+  # pgvector ships with RDS Postgres; the API's migrations run CREATE EXTENSION vector.
+  Database:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      Engine: postgres
+      EngineVersion: "17"
+      AutoMinorVersionUpgrade: true
+      DBInstanceClass: !Ref DbInstanceClass
+      AllocatedStorage: !Ref DbAllocatedStorage
+      MaxAllocatedStorage: 200
+      StorageType: gp3
+      StorageEncrypted: true
+      DBName: platform
+      MasterUsername: !Sub "{{resolve:secretsmanager:${DatabaseSecret}:SecretString:username}}"
+      MasterUserPassword: !Sub "{{resolve:secretsmanager:${DatabaseSecret}:SecretString:password}}"
+      DBSubnetGroupName: !Ref DatabaseSubnetGroup
+      VPCSecurityGroups: [!Ref DatabaseSecurityGroup]
+      PubliclyAccessible: false
+      MultiAZ: false
+      BackupRetentionPeriod: 7
+      PreferredBackupWindow: "00:00-01:00"          # 02:00-03:00 SAST
+      PreferredMaintenanceWindow: "sun:01:30-sun:02:30"
+      CopyTagsToSnapshot: true
+      DeletionProtection: !Ref DbDeletionProtection
+      EnablePerformanceInsights: false
+      Tags: [{ Key: Name, Value: !Ref AWS::StackName }]
+
+  DatabaseSecretAttachment:
+    Type: AWS::SecretsManager::SecretTargetAttachment
+    Properties:
+      SecretId: !Ref DatabaseSecret
+      TargetId: !Ref Database
+      TargetType: AWS::RDS::DBInstance
+
+  # ---------------------------------------------------------------- storage
+  # Business documents uploaded for review (direct browser upload with presigned URLs).
+  DocumentsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      VersioningConfiguration: { Status: Enabled }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      OwnershipControls:
+        Rules: [{ ObjectOwnership: BucketOwnerEnforced }]
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-old-versions
+            Status: Enabled
+            NoncurrentVersionExpiration: { NoncurrentDays: 30 }
+            AbortIncompleteMultipartUpload: { DaysAfterInitiation: 2 }
+      CorsConfiguration:
+        CorsRules:
+          - AllowedMethods: [GET, PUT, POST]
+            AllowedOrigins: !If
+              - LocalhostCallbacks
+              - [!Sub "https://app.${DomainName}", "http://localhost:3100"]
+              - [!Sub "https://app.${DomainName}"]
+            AllowedHeaders: ["*"]
+            ExposedHeaders: [ETag]
+            MaxAge: 3000
+
+  # Reference audio for custom voices and synthesized test phrases.
+  VoicesBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      VersioningConfiguration: { Status: Enabled }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      OwnershipControls:
+        Rules: [{ ObjectOwnership: BucketOwnerEnforced }]
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-old-versions
+            Status: Enabled
+            NoncurrentVersionExpiration: { NoncurrentDays: 30 }
+            AbortIncompleteMultipartUpload: { DaysAfterInitiation: 2 }
+      CorsConfiguration:
+        CorsRules:
+          - AllowedMethods: [GET, PUT, POST]
+            AllowedOrigins: !If
+              - LocalhostCallbacks
+              - [!Sub "https://app.${DomainName}", "http://localhost:3100"]
+              - [!Sub "https://app.${DomainName}"]
+            AllowedHeaders: ["*"]
+            ExposedHeaders: [ETag]
+            MaxAge: 3000
+
+  DocumentsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DocumentsBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: TlsOnly
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource: [!GetAtt DocumentsBucket.Arn, !Sub "${DocumentsBucket.Arn}/*"]
+            Condition: { Bool: { aws:SecureTransport: "false" } }
+
+  VoicesBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref VoicesBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: TlsOnly
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource: [!GetAtt VoicesBucket.Arn, !Sub "${VoicesBucket.Arn}/*"]
+            Condition: { Bool: { aws:SecureTransport: "false" } }
+
+  # ---------------------------------------------------------------- auth
+  # Businesses sign themselves up; platform admins are members of the platform_admin group (added by hand).
+  # Email goes through Cognito's built-in sender (50/day) until SES is out of the sandbox.
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      UserPoolName: !Ref AWS::StackName
+      DeletionProtection: ACTIVE
+      UsernameAttributes: [email]
+      AutoVerifiedAttributes: [email]
+      UsernameConfiguration: { CaseSensitive: false }
+      AccountRecoverySetting:
+        RecoveryMechanisms: [{ Name: verified_email, Priority: 1 }]
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 10
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+          TemporaryPasswordValidityDays: 7
+      MfaConfiguration: OPTIONAL
+      EnabledMfas: [SOFTWARE_TOKEN_MFA]
+      Schema:
+        - { Name: email, AttributeDataType: String, Required: true, Mutable: true }
+        - { Name: name, AttributeDataType: String, Required: false, Mutable: true }
+      AdminCreateUserConfig: { AllowAdminCreateUserOnly: false }
+
+  AdminGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      UserPoolId: !Ref UserPool
+      GroupName: platform_admin        # the API's ADMIN_GROUP
+      Description: Platform admins (our staff) - see the /admin console
+
+  # Public client (no secret): the Next.js app runs the authorization code flow with PKCE in the browser.
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: app
+      GenerateSecret: false
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows: [code]
+      AllowedOAuthScopes: [openid, email, profile]
+      SupportedIdentityProviders: [COGNITO]
+      CallbackURLs: !If
+        - LocalhostCallbacks
+        - [!Sub "https://app.${DomainName}/auth/callback", "http://localhost:3100/auth/callback"]
+        - [!Sub "https://app.${DomainName}/auth/callback"]
+      LogoutURLs: !If
+        - LocalhostCallbacks
+        - [!Sub "https://app.${DomainName}", "http://localhost:3100"]
+        - [!Sub "https://app.${DomainName}"]
+      ExplicitAuthFlows: [ALLOW_USER_SRP_AUTH, ALLOW_REFRESH_TOKEN_AUTH]
+      PreventUserExistenceErrors: ENABLED
+      EnableTokenRevocation: true
+      IdTokenValidity: 60
+      AccessTokenValidity: 60
+      RefreshTokenValidity: 30
+      TokenValidityUnits: { IdToken: minutes, AccessToken: minutes, RefreshToken: days }
+
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      UserPoolId: !Ref UserPool
+      Domain: !Ref AuthDomainPrefix
+
+  # ---------------------------------------------------------------- notifications
+  # Domain identity with Easy DKIM: add the three CNAMEs from the outputs in Cloudflare (DNS only, not proxied),
+  # then request SES production access.
+  EmailIdentity:
+    Type: AWS::SES::EmailIdentity
+    Properties:
+      EmailIdentity: !Ref DomainName
+      DkimSigningAttributes: { NextSigningKeyLength: RSA_2048_BIT }
+      ConfigurationSetAttributes: { ConfigurationSetName: !Ref EmailConfigurationSet }
+
+  EmailConfigurationSet:
+    Type: AWS::SES::ConfigurationSet
+    Properties:
+      Name: !Ref AWS::StackName
+      ReputationOptions: { ReputationMetricsEnabled: true }
+      SendingOptions: { SendingEnabled: true }
+
+  # Platform alarms and admin notices. SMS to people is a direct sns:Publish to a phone number.
+  AlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${AWS::StackName}-alerts"
+      KmsMasterKeyId: alias/aws/sns
+
+  AlertsEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties:
+      TopicArn: !Ref AlertsTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  # ---------------------------------------------------------------- images
+  # Immutable tags: a stack (platform or tenant) always pins an exact tag, so rollbacks are a parameter change.
+  ApiRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "${AWS::StackName}/api"
+      ImageTagMutability: IMMUTABLE
+      ImageScanningConfiguration: { ScanOnPush: true }
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {"rules": [
+            {"rulePriority": 1, "description": "Drop untagged images after a week",
+             "selection": {"tagStatus": "untagged", "countType": "sinceImagePushed", "countUnit": "days",
+                           "countNumber": 7}, "action": {"type": "expire"}},
+            {"rulePriority": 2, "description": "Keep the last 30 images",
+             "selection": {"tagStatus": "any", "countType": "imageCountMoreThan", "countNumber": 30},
+             "action": {"type": "expire"}}]}
+
+  AppRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "${AWS::StackName}/app"
+      ImageTagMutability: IMMUTABLE
+      ImageScanningConfiguration: { ScanOnPush: true }
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {"rules": [
+            {"rulePriority": 1, "description": "Drop untagged images after a week",
+             "selection": {"tagStatus": "untagged", "countType": "sinceImagePushed", "countUnit": "days",
+                           "countNumber": 7}, "action": {"type": "expire"}},
+            {"rulePriority": 2, "description": "Keep the last 30 images",
+             "selection": {"tagStatus": "any", "countType": "imageCountMoreThan", "countNumber": 30},
+             "action": {"type": "expire"}}]}
+
+  RouterRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "${AWS::StackName}/router"
+      ImageTagMutability: IMMUTABLE
+      ImageScanningConfiguration: { ScanOnPush: true }
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {"rules": [
+            {"rulePriority": 1, "description": "Drop untagged images after a week",
+             "selection": {"tagStatus": "untagged", "countType": "sinceImagePushed", "countUnit": "days",
+                           "countNumber": 7}, "action": {"type": "expire"}},
+            {"rulePriority": 2, "description": "Keep the last 30 images",
+             "selection": {"tagStatus": "any", "countType": "imageCountMoreThan", "countNumber": 30},
+             "action": {"type": "expire"}}]}
+
+  # Tenant agents pin a tag from here; keep more history since prod tenants may lag behind staging.
+  AgentRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "${AWS::StackName}/agent"
+      ImageTagMutability: IMMUTABLE
+      ImageScanningConfiguration: { ScanOnPush: true }
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {"rules": [
+            {"rulePriority": 1, "description": "Drop untagged images after a week",
+             "selection": {"tagStatus": "untagged", "countType": "sinceImagePushed", "countUnit": "days",
+                           "countNumber": 7}, "action": {"type": "expire"}},
+            {"rulePriority": 2, "description": "Keep the last 100 images",
+             "selection": {"tagStatus": "any", "countType": "imageCountMoreThan", "countNumber": 100},
+             "action": {"type": "expire"}}]}
+
+  WorkersRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "${AWS::StackName}/workers"
+      ImageTagMutability: IMMUTABLE
+      ImageScanningConfiguration: { ScanOnPush: true }
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {"rules": [
+            {"rulePriority": 1, "description": "Drop untagged images after a week",
+             "selection": {"tagStatus": "untagged", "countType": "sinceImagePushed", "countUnit": "days",
+                           "countNumber": 7}, "action": {"type": "expire"}},
+            {"rulePriority": 2, "description": "Keep the last 30 images",
+             "selection": {"tagStatus": "any", "countType": "imageCountMoreThan", "countNumber": 30},
+             "action": {"type": "expire"}}]}
+
+  # ---------------------------------------------------------------- compute
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Ref AWS::StackName
+      CapacityProviders: [FARGATE, FARGATE_SPOT]
+      DefaultCapacityProviderStrategy:
+        - { CapacityProvider: FARGATE, Weight: 1 }
+      ClusterSettings:
+        - { Name: containerInsights, Value: disabled }
+
+  # Private DNS for service-to-service calls: cloudflared -> api/app now, router -> tenant agents later
+  # (<service>.platform.internal).
+  Namespace:
+    Type: AWS::ServiceDiscovery::PrivateDnsNamespace
+    Properties:
+      Name: platform.internal
+      Vpc: !Ref Vpc
+
+  ApiDiscovery:
+    Type: AWS::ServiceDiscovery::Service
+    Properties:
+      Name: api
+      NamespaceId: !Ref Namespace
+      DnsConfig:
+        RoutingPolicy: MULTIVALUE
+        DnsRecords: [{ Type: A, TTL: 10 }]
+      HealthCheckCustomConfig: { FailureThreshold: 1 }
+
+  AppDiscovery:
+    Type: AWS::ServiceDiscovery::Service
+    Properties:
+      Name: app
+      NamespaceId: !Ref Namespace
+      DnsConfig:
+        RoutingPolicy: MULTIVALUE
+        DnsRecords: [{ Type: A, TTL: 10 }]
+      HealthCheckCustomConfig: { FailureThreshold: 1 }
+
+  ApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${AWS::StackName}/api"
+      RetentionInDays: 30
+
+  AppLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${AWS::StackName}/app"
+      RetentionInDays: 30
+
+  TunnelLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${AWS::StackName}/cloudflared"
+      RetentionInDays: 30
+
+  # Created empty-ish; set the real token once (see README) before raising TunnelDesiredCount.
+  # Its public hostnames (app./api. -> http://app.platform.internal:3000, http://api.platform.internal:8000) are
+  # configured on the tunnel in Cloudflare.
+  TunnelTokenSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${AWS::StackName}/cloudflared-token"
+      Description: Cloudflare tunnel token for the platform's cloudflared service
+      SecretString: replace-me
+
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: secrets
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: [!Ref DatabaseSecret, !Ref TunnelTokenSecret]
+
+  ApiTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: api
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:DeleteObject]
+                Resource: [!Sub "${DocumentsBucket.Arn}/*", !Sub "${VoicesBucket.Arn}/*"]
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: [!GetAtt DocumentsBucket.Arn, !GetAtt VoicesBucket.Arn]
+              - Effect: Allow
+                Action: [ses:SendEmail, ses:SendRawEmail]
+                Resource:
+                  - !Sub "arn:aws:ses:${AWS::Region}:${AWS::AccountId}:identity/${DomainName}"
+                  - !Sub "arn:aws:ses:${AWS::Region}:${AWS::AccountId}:configuration-set/${EmailConfigurationSet}"
+              # SMS to phone numbers has no resource ARN, hence "*".
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: "*"
+              # ECS Exec (`aws ecs execute-command`) for running psql/alembic inside the task.
+              - Effect: Allow
+                Action:
+                  - ssmmessages:CreateControlChannel
+                  - ssmmessages:CreateDataChannel
+                  - ssmmessages:OpenControlChannel
+                  - ssmmessages:OpenDataChannel
+                Resource: "*"
+
+  AppTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: exec
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssmmessages:CreateControlChannel
+                  - ssmmessages:CreateDataChannel
+                  - ssmmessages:OpenControlChannel
+                  - ssmmessages:OpenDataChannel
+                Resource: "*"
+
+  # The API connects as the master user for now: provisioning creates per-tenant schemas and roles.
+  ApiTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${AWS::StackName}-api"
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: "256"
+      Memory: "512"
+      RuntimePlatform: { CpuArchitecture: X86_64, OperatingSystemFamily: LINUX }
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      TaskRoleArn: !GetAtt ApiTaskRole.Arn
+      ContainerDefinitions:
+        - Name: api
+          Image: !Sub "${ApiRepository.RepositoryUri}:${ApiImageTag}"
+          Essential: true
+          PortMappings: [{ ContainerPort: 8000, Protocol: tcp }]
+          # The image expects DATABASE_URL; build it from the secret's parts, then run migrations and serve.
+          Command:
+            - sh
+            - -c
+            - >-
+              export DATABASE_URL="postgresql+asyncpg://$DB_USER:$DB_PASSWORD@$DB_HOST:5432/platform" &&
+              alembic upgrade head &&
+              exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --proxy-headers --forwarded-allow-ips '*'
+          Environment:
+            - { Name: DB_HOST, Value: !GetAtt Database.Endpoint.Address }
+            - { Name: ENVIRONMENT, Value: production }
+            - { Name: AUTH_MODE, Value: cognito }
+            - { Name: AWS_REGION, Value: !Ref AWS::Region }
+            - { Name: COGNITO_USER_POOL_ID, Value: !Ref UserPool }
+            - { Name: COGNITO_APP_CLIENT_ID, Value: !Ref UserPoolClient }
+            - { Name: CORS_ORIGINS, Value: !Sub '["https://app.${DomainName}"]' }
+            - { Name: DOCUMENTS_BUCKET, Value: !Ref DocumentsBucket }
+            - { Name: VOICES_BUCKET, Value: !Ref VoicesBucket }
+            - { Name: SES_CONFIGURATION_SET, Value: !Ref EmailConfigurationSet }
+            - { Name: EMAIL_FROM, Value: !Sub "no-reply@${DomainName}" }
+            - { Name: ALERTS_TOPIC_ARN, Value: !Ref AlertsTopic }
+          Secrets:
+            - { Name: DB_USER, ValueFrom: !Sub "${DatabaseSecret}:username::" }
+            - { Name: DB_PASSWORD, ValueFrom: !Sub "${DatabaseSecret}:password::" }
+          HealthCheck:
+            Command: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+            Interval: 15
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 60
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ApiLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: api
+
+  AppTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${AWS::StackName}-app"
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: "256"
+      Memory: "512"
+      RuntimePlatform: { CpuArchitecture: X86_64, OperatingSystemFamily: LINUX }
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      TaskRoleArn: !GetAtt AppTaskRole.Arn
+      ContainerDefinitions:
+        - Name: app
+          Image: !Sub "${AppRepository.RepositoryUri}:${AppImageTag}"
+          Essential: true
+          PortMappings: [{ ContainerPort: 3000, Protocol: tcp }]
+          HealthCheck:
+            Command: ["CMD", "node", "-e", "fetch('http://localhost:3000/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+            Interval: 15
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 30
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref AppLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: app
+
+  TunnelTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${AWS::StackName}-cloudflared"
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: "256"
+      Memory: "512"
+      RuntimePlatform: { CpuArchitecture: X86_64, OperatingSystemFamily: LINUX }
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: cloudflared
+          Image: cloudflare/cloudflared:2025.4.0
+          Essential: true
+          Command: [tunnel, --no-autoupdate, run]
+          Secrets:
+            - { Name: TUNNEL_TOKEN, ValueFrom: !Ref TunnelTokenSecret }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref TunnelLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: cloudflared
+
+  ApiService:
+    Type: AWS::ECS::Service
+    DependsOn: PublicDefaultRoute
+    Properties:
+      ServiceName: api
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref ApiTaskDefinition
+      DesiredCount: !Ref ApiDesiredCount
+      LaunchType: FARGATE
+      EnableExecuteCommand: true
+      PropagateTags: SERVICE
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+        DeploymentCircuitBreaker: { Enable: true, Rollback: true }
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets: [!Ref PublicSubnetA, !Ref PublicSubnetB]
+          SecurityGroups: [!Ref ApiSecurityGroup]
+      ServiceRegistries:
+        - RegistryArn: !GetAtt ApiDiscovery.Arn
+
+  AppService:
+    Type: AWS::ECS::Service
+    DependsOn: PublicDefaultRoute
+    Properties:
+      ServiceName: app
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref AppTaskDefinition
+      DesiredCount: !Ref AppDesiredCount
+      LaunchType: FARGATE
+      EnableExecuteCommand: true
+      PropagateTags: SERVICE
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+        DeploymentCircuitBreaker: { Enable: true, Rollback: true }
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets: [!Ref PublicSubnetA, !Ref PublicSubnetB]
+          SecurityGroups: [!Ref AppSecurityGroup]
+      ServiceRegistries:
+        - RegistryArn: !GetAtt AppDiscovery.Arn
+
+  TunnelService:
+    Type: AWS::ECS::Service
+    DependsOn: PublicDefaultRoute
+    Properties:
+      ServiceName: cloudflared
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref TunnelTaskDefinition
+      DesiredCount: !Ref TunnelDesiredCount
+      LaunchType: FARGATE
+      PropagateTags: SERVICE
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+        DeploymentCircuitBreaker: { Enable: true, Rollback: true }
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets: [!Ref PublicSubnetA, !Ref PublicSubnetB]
+          SecurityGroups: [!Ref TunnelSecurityGroup]
+
+Outputs:
+  VpcId:
+    Value: !Ref Vpc
+    Export: { Name: !Sub "${AWS::StackName}-VpcId" }
+  PublicSubnetIds:
+    Value: !Join [",", [!Ref PublicSubnetA, !Ref PublicSubnetB]]
+    Export: { Name: !Sub "${AWS::StackName}-PublicSubnetIds" }
+  ClusterName:
+    Value: !Ref Cluster
+    Export: { Name: !Sub "${AWS::StackName}-ClusterName" }
+  ClusterArn:
+    Value: !GetAtt Cluster.Arn
+    Export: { Name: !Sub "${AWS::StackName}-ClusterArn" }
+  NamespaceId:
+    Value: !Ref Namespace
+    Export: { Name: !Sub "${AWS::StackName}-NamespaceId" }
+  AgentSecurityGroupId:
+    Value: !Ref AgentSecurityGroup
+    Export: { Name: !Sub "${AWS::StackName}-AgentSecurityGroupId" }
+  DatabaseEndpoint:
+    Value: !GetAtt Database.Endpoint.Address
+    Export: { Name: !Sub "${AWS::StackName}-DatabaseEndpoint" }
+  DatabaseSecretArn:
+    Value: !Ref DatabaseSecret
+    Export: { Name: !Sub "${AWS::StackName}-DatabaseSecretArn" }
+  DocumentsBucketName:
+    Value: !Ref DocumentsBucket
+    Export: { Name: !Sub "${AWS::StackName}-DocumentsBucket" }
+  VoicesBucketName:
+    Value: !Ref VoicesBucket
+    Export: { Name: !Sub "${AWS::StackName}-VoicesBucket" }
+  AgentRepositoryUri:
+    Value: !GetAtt AgentRepository.RepositoryUri
+    Export: { Name: !Sub "${AWS::StackName}-AgentRepositoryUri" }
+  ApiRepositoryUri:
+    Value: !GetAtt ApiRepository.RepositoryUri
+  AppRepositoryUri:
+    Value: !GetAtt AppRepository.RepositoryUri
+  RouterRepositoryUri:
+    Value: !GetAtt RouterRepository.RepositoryUri
+  WorkersRepositoryUri:
+    Value: !GetAtt WorkersRepository.RepositoryUri
+  AlertsTopicArn:
+    Value: !Ref AlertsTopic
+    Export: { Name: !Sub "${AWS::StackName}-AlertsTopicArn" }
+  TunnelTokenSecretArn:
+    Value: !Ref TunnelTokenSecret
+  # Build args for the app image (NEXT_PUBLIC_* are inlined at build time).
+  UserPoolId:
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Value: !Ref UserPoolClient
+  CognitoDomain:
+    Value: !Sub "https://${AuthDomainPrefix}.auth.${AWS::Region}.amazoncognito.com"
+  AppUrl:
+    Value: !Sub "https://app.${DomainName}"
+  ApiUrl:
+    Value: !Sub "https://api.${DomainName}"
+  # Easy DKIM: CNAME <name> -> <value>, three of them, DNS only in Cloudflare.
+  DkimRecord1:
+    Value: !Sub "${EmailIdentity.DkimDNSTokenName1} CNAME ${EmailIdentity.DkimDNSTokenValue1}"
+  DkimRecord2:
+    Value: !Sub "${EmailIdentity.DkimDNSTokenName2} CNAME ${EmailIdentity.DkimDNSTokenValue2}"
+  DkimRecord3:
+    Value: !Sub "${EmailIdentity.DkimDNSTokenName3} CNAME ${EmailIdentity.DkimDNSTokenValue3}"

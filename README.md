@@ -16,11 +16,40 @@ This repo holds two things:
 | `services/api/` | Control-plane API (FastAPI, SQLAlchemy, Alembic): businesses, onboarding, review, provisioning, dashboards |
 | `services/agent/` | Pipecat voice agent, used by both the live server and (soon) the platform |
 | `services/tts/` | VoxCPM2 text-to-speech on Modal |
-| `infra/aws/` | CloudFormation: the GitHub Actions deploy role (`github-ci.yaml`); the platform's stacks will go here |
+| `infra/aws/` | CloudFormation: the platform's shared core (`platform-core.yaml`) and the GitHub Actions deploy role (`github-ci.yaml`); per-tenant stacks will go here |
 | `infra/local/` | Local-only setup, such as the platform database's init scripts |
 | `legacy/` | The live single-business server: `compose.yaml`, `deploy-server.sh`, `ec2.yaml`, `metabase-setup.py`, Postgres schema (`db/`), n8n workflows (`n8n-workflows/`), prompt and tool list (`shared/`) |
 | `compose.yaml` | Local platform stack: `docker compose up -d --build`, then the app on http://localhost:3100 and the API on http://localhost:8100/docs |
 | `.github/workflows/ci-cd.yml` | Checks on every push and PR; deploys `main` to the live server |
+
+## Platform on AWS (`infra/aws/platform-core.yaml`)
+
+One shared stack in us-east-1: VPC (public subnets for tasks, private for RDS, no NAT), ECS Fargate cluster with
+Cloud Map (`*.platform.internal`), RDS Postgres 17 with pgvector, S3 buckets for documents and voice samples,
+Cognito (user pool, `platform_admin` group, PKCE app client, login domain), ECR repositories (`api`, `app`,
+`router`, `agent`, `workers`), an SES domain identity, an SNS alerts topic, and the `api`, `app` and `cloudflared`
+services. Each tenant environment will be its own `tenant.yaml` stack importing this one's exports. Not deployed yet.
+
+First deploy (services start at 0 tasks, because no images exist yet; AWS CLI run through Docker):
+
+```sh
+aws() { docker run --rm -v ~/.aws:/root/.aws:ro -v "$PWD:/aws" -e AWS_PROFILE -e AWS_REGION=us-east-1 amazon/aws-cli "$@"; }
+aws cloudformation deploy --stack-name voice-platform --template-file infra/aws/platform-core.yaml \
+  --capabilities CAPABILITY_IAM --parameter-overrides DomainName=<domain> AuthDomainPrefix=<unique-prefix>
+aws cloudformation describe-stacks --stack-name voice-platform --query 'Stacks[0].Outputs'
+```
+
+Then:
+1. **DNS:** add the three DKIM CNAMEs from the outputs in Cloudflare (DNS only), then request SES production access.
+2. **Tunnel:** create a Cloudflare tunnel with public hostnames `app.<domain>` → `http://app.platform.internal:3000`
+   and `api.<domain>` → `http://api.platform.internal:8000`, then store its token:
+   `aws secretsmanager put-secret-value --secret-id voice-platform/cloudflared-token --secret-string <token>`.
+3. **Images:** push `services/api` and `apps/app` to their ECR repositories with an immutable tag. Build the app
+   with the `NEXT_PUBLIC_*` build args from the outputs (`NEXT_PUBLIC_API_URL=https://api.<domain>`,
+   `NEXT_PUBLIC_COGNITO_USER_POOL_ID`, `NEXT_PUBLIC_COGNITO_CLIENT_ID`, `NEXT_PUBLIC_COGNITO_DOMAIN`).
+4. **Run:** redeploy with `ApiImageTag`, `AppImageTag` and `ApiDesiredCount=1 AppDesiredCount=1 TunnelDesiredCount=1`
+   (`cloudformation deploy` keeps the previous value of any parameter you leave out).
+5. **Admins:** after signing up in the app, add yourself to the `platform_admin` group in Cognito.
 
 ## The live single-business agent
 

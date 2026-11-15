@@ -1,6 +1,6 @@
 """LLM tools: n8n-backed business tools, plus booking changes run against the call store.
 
-Tool schemas live in shared/tools.json (Anthropic format) so the WhatsApp voice-note flow in n8n
+Tool schemas live in legacy/shared/tools.json (Anthropic format) so the WhatsApp voice-note flow in n8n
 and this bot offer the same tools. Every tool is executed by POSTing
 `{tool, input, channel, phone}` to `$N8N_URL/webhook/tool` and handing the JSON response back to Claude.
 """
@@ -73,7 +73,7 @@ def register_n8n_tools(
 
 
 # Tools that change existing bookings. They run here, against the call store, rather than in n8n: the bookings
-# live in Postgres. They aren't in shared/tools.json, so the n8n voice-note flow doesn't offer them.
+# live in Postgres. They aren't in legacy/shared/tools.json, so the n8n voice-note flow doesn't offer them.
 BOOKING_TOOLS = [
     {
         "name": "reschedule_booking",

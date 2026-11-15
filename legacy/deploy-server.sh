@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
-# Deploys the voice agent to one EC2 instance in us-east-1 (infra/ec2.yaml). The AWS CLI runs in Docker
+# Deploys the voice agent to one EC2 instance in us-east-1 (legacy/ec2.yaml). The AWS CLI runs in Docker
 # with ~/.aws mounted, and the server is reached through SSM only (no SSH).
 #
-#   scripts/deploy-server.sh up              set up everything from scratch: infra, ci, env, release, n8n, dashboard
-#   scripts/deploy-server.sh down            back up the database, then delete everything this project created in AWS
-#   scripts/deploy-server.sh backup          pg_dump the server's database to .deploy/backups/
-#   scripts/deploy-server.sh restore [file]  replace the server's database with a backup (default: the newest)
-#   scripts/deploy-server.sh infra           create/update the stack (EC2, Elastic IP, role, deploy bucket)
-#   scripts/deploy-server.sh ci              create/update the GitHub Actions deploy role (infra/github-ci.yaml)
-#   scripts/deploy-server.sh env             store the local .env (with server overrides) for the server
-#   scripts/deploy-server.sh release         upload the repo, apply the db schema, `docker compose up -d --build`
-#   scripts/deploy-server.sh app             env + release (a full deploy from this machine)
-#   scripts/deploy-server.sh n8n-setup       first deploy only: create the n8n owner, import + publish workflows
-#   scripts/deploy-server.sh run '<cmd>'     run a shell command in /opt/voice-agent on the server
+#   legacy/deploy-server.sh up              set up everything from scratch: infra, ci, env, release, n8n, dashboard
+#   legacy/deploy-server.sh down            back up the database, then delete everything this project created in AWS
+#   legacy/deploy-server.sh backup          pg_dump the server's database to .deploy/backups/
+#   legacy/deploy-server.sh restore [file]  replace the server's database with a backup (default: the newest)
+#   legacy/deploy-server.sh infra           create/update the stack (EC2, Elastic IP, role, deploy bucket)
+#   legacy/deploy-server.sh ci              create/update the GitHub Actions deploy role (infra/aws/github-ci.yaml)
+#   legacy/deploy-server.sh env             store the local .env (with server overrides) for the server
+#   legacy/deploy-server.sh release         upload the repo, apply the db schema, `docker compose up -d --build`
+#   legacy/deploy-server.sh app             env + release (a full deploy from this machine)
+#   legacy/deploy-server.sh n8n-setup       first deploy only: create the n8n owner, import + publish workflows
+#   legacy/deploy-server.sh run '<cmd>'     run a shell command in /opt/voice-agent on the server
 #
 # The server's .env is the local .env with server overrides (see server_env), stored as an SSM SecureString.
 # CI (.github/workflows/ci-cd.yml) only runs `release`, so secrets never go to GitHub; run `env` after changing .env.
@@ -41,7 +41,10 @@ remote() {
   local id script cmd status
   id=$(output InstanceId)
   # Base64 keeps the script intact inside the JSON parameters.
-  script=$(printf 'set -euo pipefail\nexport HOME=/root PATH=$PATH:/snap/bin AWS_DEFAULT_REGION=%s\nmkdir -p /opt/voice-agent\ncd /opt/voice-agent\n%s\n' \
+  # `docker compose` on the server means legacy/compose.yaml under the project name voice-agent (the name the
+  # containers and volumes had when the compose file sat in the repo root). Compose reads .env from the compose
+  # file's folder, so legacy/.env links to the server's /opt/voice-agent/.env.
+  script=$(printf 'set -euo pipefail\nexport HOME=/root PATH=$PATH:/snap/bin AWS_DEFAULT_REGION=%s\nexport COMPOSE_FILE=legacy/compose.yaml COMPOSE_PROJECT_NAME=voice-agent\nmkdir -p /opt/voice-agent\ncd /opt/voice-agent\n[ ! -d legacy ] || ln -sfn ../.env legacy/.env\n%s\n' \
     "$AWS_REGION" "$1" | base64 -w0)
   cmd=$(aws ssm send-command --instance-ids "$id" --document-name AWS-RunShellScript \
     --parameters "{\"commands\":[\"echo $script | base64 -d > /tmp/voice-agent-cmd.sh && bash /tmp/voice-agent-cmd.sh\"],\"executionTimeout\":[\"3600\"]}" \
@@ -66,7 +69,7 @@ server_env() {
   # The instance sits behind EC2's 1:1 NAT; STUN lets the bot advertise its Elastic IP to WebRTC peers.
   echo "PIPECAT_ICE_SERVERS=stun:stun.l.google.com:19302"
   # Nova 2 Lite until the account's Claude Haiku 4.5 agreement goes through (Haiku currently fails with
-  # ResourceNotFoundException). Override per deploy: BEDROCK_MODEL=<model id> scripts/deploy-server.sh app
+  # ResourceNotFoundException). Override per deploy: BEDROCK_MODEL=<model id> legacy/deploy-server.sh app
   echo "BEDROCK_MODEL=${BEDROCK_MODEL:-us.amazon.nova-2-lite-v1:0}"
 }
 
@@ -90,7 +93,7 @@ case ${1:-} in
     remote 'cloud-init status --wait >/dev/null || [ $? -eq 2 ]'
     "$0" app
     "$0" n8n-setup
-    "$0" run 'python3 scripts/metabase-setup.py'
+    "$0" run 'python3 legacy/metabase-setup.py'
     echo "Set up. Point the Meta webhook at https://voice-agent.njmtech.co.za/whatsapp if it isn't already."
     ;;
 
@@ -131,12 +134,12 @@ case ${1:-} in
     ;;
 
   infra)
-    aws cloudformation deploy --template-file /aws/infra/ec2.yaml --stack-name "$STACK" --capabilities CAPABILITY_IAM
+    aws cloudformation deploy --template-file /aws/legacy/ec2.yaml --stack-name "$STACK" --capabilities CAPABILITY_IAM
     aws cloudformation describe-stacks --stack-name "$STACK" --query 'Stacks[0].Outputs' --output table
     ;;
 
   ci)
-    aws cloudformation deploy --template-file /aws/infra/github-ci.yaml --stack-name "$STACK-ci" \
+    aws cloudformation deploy --template-file /aws/infra/aws/github-ci.yaml --stack-name "$STACK-ci" \
       --capabilities CAPABILITY_NAMED_IAM \
       --parameter-overrides "InstanceId=$(output InstanceId)" "DeployBucket=$(output DeployBucket)" "AppStackName=$STACK"
     aws cloudformation describe-stacks --stack-name "$STACK-ci" --query 'Stacks[0].Outputs' --output table
@@ -155,8 +158,9 @@ case ${1:-} in
 
   release)
     mkdir -p "$WORK"
-    tar czf "$WORK/bundle.tgz" --exclude=./.env --exclude=./.deploy --exclude=./.claude --exclude=./.git \
-      --exclude=./.github --exclude=.venv --exclude=__pycache__ --exclude='*.wav' .
+    # Only what the server runs: the legacy stack and the services it builds (not apps/, infra/ or node_modules).
+    tar czf "$WORK/bundle.tgz" --exclude=.env --exclude=.venv --exclude=__pycache__ --exclude=node_modules \
+      --exclude='*.wav' legacy services
     bucket=$(output DeployBucket)
     param=$(output EnvParameterName)
     aws s3 cp /aws/.deploy/bundle.tgz "s3://$bucket/bundle.tgz"
@@ -169,6 +173,7 @@ aws ssm get-parameter --name $param --with-decryption --query Parameter.Value --
 # An empty .env would start every service with blank keys, so refuse it.
 [ -s .env.new ] || { echo 'fetched .env is empty' >&2; exit 1; }
 mv .env.new .env
+ln -sfn ../.env legacy/.env
 # Schema first (db/ is idempotent), so the new bot never runs against missing columns.
 docker compose up -d --wait db
 docker compose exec -T -e PGOPTIONS='-c client_min_messages=warning' db \

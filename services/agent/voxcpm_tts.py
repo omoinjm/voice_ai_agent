@@ -1,4 +1,4 @@
-"""Pipecat TTS service for the VoxCPM2 Modal app (tts/modal_app.py).
+"""Pipecat TTS service for the VoxCPM2 Modal app (services/tts/modal_app.py).
 
 Streams raw PCM16 from `POST /v1/audio/stream` at the pipeline's output sample rate. When the
 user interrupts, Pipecat cancels `run_tts`, which closes the HTTP request; the server sees the

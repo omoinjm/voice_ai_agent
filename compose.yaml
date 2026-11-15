@@ -1,8 +1,10 @@
-# Local development stack for the SaaS platform (separate from the single-tenant ../docker-compose.yml, which
-# still runs the live server until cutover).
-#   docker compose -f platform/docker-compose.yml up -d --build
-#   API: http://localhost:8100/docs   Web: http://localhost:3100
-# Auth is in dev mode: send `Authorization: Bearer dev:you@example.com` (add `:admin` for a platform admin).
+# Local development stack for the SaaS platform. (The single-business server that is live today runs
+# legacy/compose.yaml instead; see legacy/deploy-server.sh.)
+#   docker compose up -d --build
+#   App (merchant portal + /admin): http://localhost:3100    API: http://localhost:8100/docs
+#   API tests: docker compose run --rm api pytest
+# Auth is in dev mode: sign in with any email locally (tick "Platform admin" for the admin console), or send
+# `Authorization: Bearer dev:you@example.com` (`:admin` appended for a platform admin) to the API.
 name: voice-platform
 
 services:
@@ -17,7 +19,7 @@ services:
       - POSTGRES_DB=platform
     volumes:
       - db_data:/var/lib/postgresql/data
-      - ./db/init:/docker-entrypoint-initdb.d:ro
+      - ./infra/local/db-init:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD", "pg_isready", "-U", "platform"]
       interval: 3s
@@ -26,7 +28,7 @@ services:
 
   api:
     build:
-      context: ./api
+      context: ./services/api
       additional_contexts:
         uvcache: ${HOME}/.cache/uv
       args:
@@ -43,16 +45,16 @@ services:
       - AWS_REGION=us-east-1
     volumes:
       # Live code for --reload; the venv stays in the image.
-      - ./api/app:/app/app
-      - ./api/migrations:/app/migrations
-      - ./api/tests:/app/tests
+      - ./services/api/app:/app/app
+      - ./services/api/migrations:/app/migrations
+      - ./services/api/tests:/app/tests
     command: ["sh", "-c", "alembic upgrade head && exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"]
     depends_on:
       db:
         condition: service_healthy
 
   # Next.js dev server with hot reload. node_modules lives in a volume so the host never needs npm.
-  web:
+  app:
     image: node:22-alpine
     restart: unless-stopped
     working_dir: /app
@@ -64,12 +66,12 @@ services:
       - NEXT_TELEMETRY_DISABLED=1
       - WATCHPACK_POLLING=true
     volumes:
-      - ./web:/app
-      - web_node_modules:/app/node_modules
+      - ./apps/app:/app
+      - app_node_modules:/app/node_modules
     command: ["sh", "-c", "npm ci && exec npm run dev -- --hostname 0.0.0.0 --port 3000"]
     depends_on:
       - api
 
 volumes:
   db_data:
-  web_node_modules:
+  app_node_modules:

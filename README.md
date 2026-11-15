@@ -1,5 +1,29 @@
 # Voice AI Agent
 
+This repo holds two things:
+
+- **The voice agent platform (in progress):** a SaaS where any business (medical, legal, insurance, financial, and
+  so on) registers, gets reviewed, connects its WhatsApp Business number, sets up its own agent, and runs it on a
+  staging and a production deployment. It is made of `apps/`, `services/api/`, `infra/` and the root `compose.yaml`.
+- **The single-business voice agent that is live today** (Demo Co), described in the rest of this README. Its
+  server pieces sit in `legacy/` and go away once Demo Co moves onto the platform.
+
+## Repository layout
+
+| Path | What |
+|---|---|
+| `apps/app/` | Next.js web app: the merchant portal and our admin console (`/admin`). The public website will go in `apps/website/` |
+| `services/api/` | Control-plane API (FastAPI, SQLAlchemy, Alembic): businesses, onboarding, review, provisioning, dashboards |
+| `services/agent/` | Pipecat voice agent, used by both the live server and (soon) the platform |
+| `services/tts/` | VoxCPM2 text-to-speech on Modal |
+| `infra/aws/` | CloudFormation: the GitHub Actions deploy role (`github-ci.yaml`); the platform's stacks will go here |
+| `infra/local/` | Local-only setup, such as the platform database's init scripts |
+| `legacy/` | The live single-business server: `compose.yaml`, `deploy-server.sh`, `ec2.yaml`, `metabase-setup.py`, Postgres schema (`db/`), n8n workflows (`n8n-workflows/`), prompt and tool list (`shared/`) |
+| `compose.yaml` | Local platform stack: `docker compose up -d --build`, then the app on http://localhost:3100 and the API on http://localhost:8100/docs |
+| `.github/workflows/ci-cd.yml` | Checks on every push and PR; deploys `main` to the live server |
+
+## The live single-business agent
+
 A voice agent on two channels, sharing one prompt, one set of tools, and one voice:
 
 | Channel | Path |
@@ -25,13 +49,13 @@ WhatsApp voice note ─► openwa-api ─► n8n /webhook/whatsapp-voice ─► 
                     ◄── send-audio {ptt:true} ◄── VoxCPM2 /v1/audio/speech (ogg/opus)
 ```
 
-## Stack
+### Stack
 
 | Layer | Technology |
 |---|---|
 | Voice pipeline | [Pipecat](https://github.com/pipecat-ai/pipecat) 1.12 (Python 3.12), SmallWebRTC transport for both browser and WhatsApp calls |
 | Speech to text | Deepgram Flux (`flux-general-en`), which also decides when the caller has finished speaking |
-| LLM | Amazon Bedrock: Nova 2 Lite on the server, Claude Haiku 4.5 as the default once enabled; Workers AI GPT-OSS-120B and the Claude API as fallbacks (`agent/llm.py`) |
+| LLM | Amazon Bedrock: Nova 2 Lite on the server, Claude Haiku 4.5 as the default once enabled; Workers AI GPT-OSS-120B and the Claude API as fallbacks (`services/agent/llm.py`) |
 | Text to speech | Deepgram Aura-2 over a WebSocket; Workers AI Aura and VoxCPM2 on a Modal L4 GPU as alternatives |
 | Telephony | WhatsApp Cloud API Calling (calls in) and messages (booking confirmations); openwa for voice-note testing |
 | Business tools | n8n (tool webhooks, post-call summary, voice-note flow) |
@@ -39,56 +63,57 @@ WhatsApp voice note ─► openwa-api ─► n8n /webhook/whatsapp-voice ─► 
 | Dashboard | Metabase, reading Postgres through a read-only role |
 | Hosting | One EC2 c7i-flex.large (Ubuntu 24.04, pinned image) running Docker Compose; Elastic IP for call audio |
 | Networking | Cloudflare Tunnel (`voice-agent.` and `bookings.njmtech.co.za`); no SSH or open TCP ports |
-| Infrastructure as code | CloudFormation (`infra/ec2.yaml`, `infra/github-ci.yaml`); admin through SSM only |
+| Infrastructure as code | CloudFormation (`legacy/ec2.yaml`, `infra/aws/github-ci.yaml`); admin through SSM only |
 | Secrets | `.env` locally, stored on AWS as an SSM SecureString; never in GitHub |
 | CI/CD | GitHub Actions: ruff, shellcheck, cfn-lint, compose check, image build; deploys `main` over SSM through a GitHub OIDC role |
-| Dependencies | uv (locked in `agent/uv.lock`), Docker images for everything |
+| Dependencies | uv (locked in `services/agent/uv.lock`), Docker images for everything |
 
-## Layout
+### Files
 
 | Path | What |
 |---|---|
-| `agent/` | Pipecat bot (`bot.py`), LLM choice (`llm.py`: Bedrock, Workers AI or Claude API), tools (`tools.py`: n8n-backed tools plus booking reschedule/cancel), call records (`store.py`), WhatsApp booking messages (`notify.py`), TTS services (`cloudflare_tts.py`, `voxcpm_tts.py`), Workers AI LLM adapter (`cloudflare_llm.py`), test scripts (`_smoke_test.py`, `_call_test.py`) |
-| `shared/system.md`, `shared/tools.json` | One persona and one tool list, used by both the bot and n8n |
-| `db/` | Postgres schema (`10-schema.sql`, re-applied on every release) and dashboard roles (`20-roles.sh`) |
-| `n8n-workflows/` | `whatsapp_voice_note`, `agent_tools` (the tool implementations; stubs for now), `post_call` |
-| `tts/modal_app.py` | VoxCPM2 on a Modal L4 GPU (scale-to-zero). `/v1/audio/speech` (wav/ogg/pcm), `/v1/audio/stream` (chunked PCM16), `/health` |
-| `infra/` | The EC2 server (`ec2.yaml`) and the GitHub Actions deploy role (`github-ci.yaml`), in CloudFormation |
-| `scripts/` | `deploy-server.sh` (infra, env, release, run on the server), `metabase-setup.py` (dashboard setup) |
-| `.github/workflows/ci-cd.yml` | Checks on every push and PR; deploys `main` to the server |
+| `services/agent/` | Pipecat bot (`bot.py`), LLM choice (`llm.py`: Bedrock, Workers AI or Claude API), tools (`tools.py`: n8n-backed tools plus booking reschedule/cancel), call records (`store.py`), WhatsApp booking messages (`notify.py`), TTS services (`cloudflare_tts.py`, `voxcpm_tts.py`), Workers AI LLM adapter (`cloudflare_llm.py`), test scripts (`_smoke_test.py`, `_call_test.py`) |
+| `legacy/shared/system.md`, `legacy/shared/tools.json` | One persona and one tool list, used by both the bot and n8n |
+| `legacy/db/` | Postgres schema (`10-schema.sql`, re-applied on every release) and dashboard roles (`20-roles.sh`) |
+| `legacy/n8n-workflows/` | `whatsapp_voice_note`, `agent_tools` (the tool implementations; stubs for now), `post_call` |
+| `services/tts/modal_app.py` | VoxCPM2 on a Modal L4 GPU (scale-to-zero). `/v1/audio/speech` (wav/ogg/pcm), `/v1/audio/stream` (chunked PCM16), `/health` |
+| `legacy/compose.yaml` | The stack: Postgres, Metabase, n8n, the agent, the Cloudflare tunnel, and the Modal CLI |
+| `legacy/ec2.yaml`, `infra/aws/github-ci.yaml` | The EC2 server and the GitHub Actions deploy role, in CloudFormation |
+| `legacy/deploy-server.sh`, `legacy/metabase-setup.py` | Deploy script (infra, env, release, run on the server) and dashboard setup |
 
-## Setup
+### Setup
 
-### 1. Accounts and keys
-`cp .env.example .env`, then fill it in:
+#### 1. Accounts and keys
+`cp .env.example .env` and `ln -s ../.env legacy/.env` (Compose reads `.env` from the compose file's folder), then
+fill in `.env`:
 - `ANTHROPIC_API_KEY`
 - `DEEPGRAM_API_KEY` (the free credit is plenty for testing)
 - `STT_API_KEY` and `STT_BASE_URL` of the existing `cloudflare-stt` Worker
 - `OPENWA_API_KEY`
 - `TOOLS_SECRET`: any random string
 
-### 2. LLM
+#### 2. LLM
 **Default: Claude on Amazon Bedrock** (`LLM_PROVIDER=bedrock`, model `BEDROCK_MODEL`, default `us.anthropic.claude-haiku-4-5-20251001-v1:0` in `AWS_REGION=us-east-1`). Locally the container reads your default `~/.aws` profile (mounted read-only); on EC2 it uses the instance role. Prompt caching is on, so later turns start faster.
 **Fallback: Cloudflare Workers AI** (`LLM_PROVIDER=cloudflare`, model `CF_LLM_MODEL`, same account and token as the TTS, free daily allowance). `gpt-oss-120b` was the most accurate in simulated calls (uses tools, never invents bookings); it needs `max_tokens` around 1024 because its hidden reasoning counts against the limit. `cloudflare_llm.py` works around two Workers AI quirks: assistant tool-call messages need `content: ""` (not null), and number tokens can stream as JSON numbers.
 **Optional: Claude** (`LLM_PROVIDER=anthropic`, needs Anthropic credits; set `ANTHROPIC_WORKSPACE_ID` only for `sk-ant-usr-` keys).
 Simulated call with latency numbers (synthetic caller speech streamed in real time): `docker exec voice-agent python /app/_call_test.py "question one" "question two"`
 
-### 2b. TTS
+#### 2b. TTS
 **Default: Cloudflare Workers AI** (Deepgram Aura, free daily allowance). Set `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_AI_TOKEN` (an API token with the Workers AI template) in `.env`; `CF_TTS_MODEL` and `CF_TTS_SPEAKER` choose the voice. Nothing to deploy.
 
 **Optional: VoxCPM2 on Modal** (`TTS_PROVIDER=voxcpm`; Modal needs a payment method for GPUs):
 ```bash
-docker compose run --rm modal token new                                   # opens a login link; saved in the modal_config volume
-docker compose run --rm modal secret create voxcpm-auth VOXCPM_TOKEN=$(openssl rand -hex 24)   # put the same value in .env
-docker compose run --rm modal deploy modal_app.py                         # prints the URL -> VOXCPM_URL
+docker compose -f legacy/compose.yaml run --rm modal token new                                   # opens a login link; saved in the modal_config volume
+docker compose -f legacy/compose.yaml run --rm modal secret create voxcpm-auth VOXCPM_TOKEN=$(openssl rand -hex 24)   # put the same value in .env
+docker compose -f legacy/compose.yaml run --rm modal deploy modal_app.py                         # prints the URL -> VOXCPM_URL
 ```
-- **Voice:** by default the voice comes from the `VOICE_DESCRIPTION` prompt in `modal_app.py`. To clone a voice instead, add `tts/voices/agent.wav` (10–20 s, clean) and `agent.txt` (its exact transcript), then redeploy.
+- **Voice:** by default the voice comes from the `VOICE_DESCRIPTION` prompt in `modal_app.py`. To clone a voice instead, add `services/tts/voices/agent.wav` (10–20 s, clean) and `agent.txt` (its exact transcript), then redeploy.
 - **Test:** `curl -H "Authorization: Bearer $VOXCPM_TOKEN" -H 'content-type: application/json' -d '{"input":"Hello from Demo Co.","response_format":"wav"}' $VOXCPM_URL/v1/audio/speech -o hello.wav`
 - **Cold start:** the first request after idle takes about 30–90 s while the container boots. After that, requests take seconds.
 
-### 3. n8n
+#### 3. n8n
 ```bash
-docker compose up -d n8n          # http://localhost:5679 (create the owner account, put it in .env)
+docker compose -f legacy/compose.yaml up -d n8n          # http://localhost:5679 (create the owner account, put it in .env)
 for f in agent_tools post_call whatsapp_voice_note; do docker exec voice-n8n n8n import:workflow --input=/workflows/$f.json; done
 for id in VoiceAgentTools0001 VoiceAgentPostCall1 VoiceAgentWaVoice1; do docker exec voice-n8n n8n publish:workflow --id=$id; done
 docker restart voice-n8n
@@ -96,16 +121,16 @@ docker restart voice-n8n
 - The tools webhook is `POST /webhook/tool` with body `{tool, input, channel, phone}`.
 - Replace the demo bodies in the **Run Tool** node with your real lookups and bookings.
 
-### 4. Real-time bot locally (browser)
+#### 4. Real-time bot locally (browser)
 ```bash
-docker compose up -d --build agent                 # rebuild after changing agent/*.py
-docker compose logs -f agent
+docker compose -f legacy/compose.yaml up -d --build agent                 # rebuild after changing services/agent/*.py
+docker compose -f legacy/compose.yaml logs -f agent
 ```
 - Open http://localhost:7860 and click Connect.
 - The bot wakes the Modal container as soon as you connect.
 - The `agent` service uses `network_mode: host`. WebRTC media goes over UDP on random ports, and Docker port mapping doesn't pass it through.
 
-### 5. WhatsApp voice notes via openwa (test number)
+#### 5. WhatsApp voice notes via openwa (test number)
 Use a **separate WhatsApp number and session**. Never link a second client to the carwash number.
 1. Join the gateway to this network: `docker network connect voice_ai_agent_default openwa-api`
 2. Add `voice-n8n` to `SSRF_ALLOWED_HOSTS` in the gateway's `.env` (comma-separated), then restart the gateway.
@@ -115,7 +140,7 @@ Use a **separate WhatsApp number and session**. Never link a second client to th
 4. Optional: set `ALLOWED_PHONE_NUMBERS` so the bot only answers you.
 5. Send the test number a voice note (or a text). It replies with a voice note.
 
-### 6. WhatsApp Business calls (Meta Cloud API)
+#### 6. WhatsApp Business calls (Meta Cloud API)
 openwa can't take calls; they come through Meta's official Calling API. Pipecat answers them with the same bot.
 
 **Prerequisites:**
@@ -126,48 +151,48 @@ openwa can't take calls; they come through Meta's official Calling API. Pipecat 
 
 **Steps:**
 1. Add these to `.env`: `WHATSAPP_TOKEN` (a permanent system-user token), `WHATSAPP_PHONE_NUMBER_ID`, `WHATSAPP_APP_SECRET`, `WHATSAPP_WEBHOOK_VERIFICATION_TOKEN`.
-2. Run `docker compose up -d --build agent cloudflared`. The `agent` service already starts the bot with `--whatsapp`. The named tunnel `voice-agent` serves the bot at **https://voice-agent.njmtech.co.za**. Set the Meta webhook to `https://voice-agent.njmtech.co.za/whatsapp`, subscribed to `calls`.
+2. Run `docker compose -f legacy/compose.yaml up -d --build agent cloudflared`. The `agent` service already starts the bot with `--whatsapp`. The named tunnel `voice-agent` serves the bot at **https://voice-agent.njmtech.co.za**. Set the Meta webhook to `https://voice-agent.njmtech.co.za/whatsapp`, subscribed to `calls`.
 3. Meta's US sandbox test numbers can't call some countries (error 130497). Use a real business number.
 
-### 7. Deploy to AWS (EC2, us-east-1)
+#### 7. Deploy to AWS (EC2, us-east-1)
 The server runs the same compose stack (`agent`, `n8n`, `cloudflared`); only its `.env` differs (`LLM_PROVIDER=bedrock`, `PIPECAT_ICE_SERVERS` STUN so WebRTC peers get the Elastic IP). WhatsApp voice notes stay local, because the openwa gateway belongs to the carwash project.
 ```bash
-scripts/deploy-server.sh up          # everything below in one go, from an empty account (~20 min)
-scripts/deploy-server.sh down        # back up Postgres, then delete it all: both stacks, the bucket, the .env parameter (asks first)
-scripts/deploy-server.sh backup      # pg_dump the server's database to .deploy/backups/ (git-ignored)
-scripts/deploy-server.sh restore     # load the newest backup (or a given file) into the server's database, e.g. after `up`
+legacy/deploy-server.sh up          # everything below in one go, from an empty account (~20 min)
+legacy/deploy-server.sh down        # back up Postgres, then delete it all: both stacks, the bucket, the .env parameter (asks first)
+legacy/deploy-server.sh backup      # pg_dump the server's database to .deploy/backups/ (git-ignored)
+legacy/deploy-server.sh restore     # load the newest backup (or a given file) into the server's database, e.g. after `up`
 
-scripts/deploy-server.sh infra       # c7i-flex.large + Elastic IP + role + deploy bucket (~$34/month while running)
-scripts/deploy-server.sh app         # upload the repo + .env, build and start on the server (first build ~10 min)
-scripts/deploy-server.sh n8n-setup   # first deploy only: n8n owner, tool + post-call workflows
-scripts/deploy-server.sh run 'docker compose logs --tail 100 agent'
+legacy/deploy-server.sh infra       # c7i-flex.large + Elastic IP + role + deploy bucket (~$34/month while running)
+legacy/deploy-server.sh app         # upload the repo + .env, build and start on the server (first build ~10 min)
+legacy/deploy-server.sh n8n-setup   # first deploy only: n8n owner, tool + post-call workflows
+legacy/deploy-server.sh run 'docker compose logs --tail 100 agent'
 ```
 - Stop the local `cloudflared` (and `agent`) first: two connectors on the same tunnel split the traffic between them.
 - No SSH or open TCP ports: HTTP comes through the tunnel, admin goes through SSM.
 - To pause costs, stop the instance in the EC2 console (the Elastic IP still costs ~$3.60/month); `docker compose` services restart with it.
-- The instance image is pinned in `infra/ec2.yaml` (`ImageId`), so `infra` updates don't replace the instance.
+- The instance image is pinned in `legacy/ec2.yaml` (`ImageId`), so `infra` updates don't replace the instance.
   Changing `ImageId` would, and it takes the Postgres and n8n data with it (see "Replace the instance" in section 10).
 - Section 10 covers every other situation: pausing, backups, restores, teardown and failures.
 
-### 8. Call records and dashboard
-The bot saves calls, turns, tool calls and bookings to Postgres (`db`, schema in `db/10-schema.sql`) as they happen.
+#### 8. Call records and dashboard
+The bot saves calls, turns, tool calls and bookings to Postgres (`db`, schema in `legacy/db/10-schema.sql`) as they happen.
 On the server, Metabase (`metabase`, compose profile `dashboard`) shows them at https://bookings.njmtech.co.za.
-First time only: `scripts/deploy-server.sh run 'python3 scripts/metabase-setup.py'` creates the admin login
+First time only: `legacy/deploy-server.sh run 'python3 legacy/metabase-setup.py'` creates the admin login
 (`METABASE_ADMIN_PASSWORD`) and the Bookings dashboard.
 
-### 9. CI/CD (GitHub Actions)
+#### 9. CI/CD (GitHub Actions)
 `.github/workflows/ci-cd.yml` runs ruff, shellcheck, cfn-lint, a compose check and an agent image build on every PR
-and push. Pushes to `main` then run `scripts/deploy-server.sh release` and smoke-test both public URLs.
-- AWS access is GitHub OIDC (no stored keys): `scripts/deploy-server.sh ci` creates the `voice-agent-github-deploy`
-  role (`infra/github-ci.yaml`), whose ARN goes in the repo variable `AWS_DEPLOY_ROLE_ARN`.
+and push. Pushes to `main` then run `legacy/deploy-server.sh release` and smoke-test both public URLs.
+- AWS access is GitHub OIDC (no stored keys): `legacy/deploy-server.sh ci` creates the `voice-agent-github-deploy`
+  role (`infra/aws/github-ci.yaml`), whose ARN goes in the repo variable `AWS_DEPLOY_ROLE_ARN`.
 - Secrets never go to GitHub. The server's `.env` lives in SSM; after changing `.env`, run
-  `scripts/deploy-server.sh env` (applied on the next release).
-- Every release re-applies `db/10-schema.sql`, so keep it idempotent (new columns also go in its
+  `legacy/deploy-server.sh env` (applied on the next release).
+- Every release re-applies `legacy/db/10-schema.sql`, so keep it idempotent (new columns also go in its
   `ADD COLUMN IF NOT EXISTS` section).
 - A release restarts the bot, which drops any call in progress.
 
-### 10. Server runbook
-Every command is `scripts/deploy-server.sh <command>`, run from a machine with Docker, the filled-in `.env` and
+#### 10. Server runbook
+Every command is `legacy/deploy-server.sh <command>`, run from a machine with Docker, the filled-in `.env` and
 AWS credentials in `~/.aws` (`aws login`). Commands that delete or replace data ask you to type `voice-agent` first.
 
 **First setup, empty account:** `up` (about 20 min).
@@ -176,7 +201,7 @@ AWS credentials in `~/.aws` (`aws login`). Commands that delete or replace data 
 - Also before it: Bedrock model access for the model in `BEDROCK_MODEL` (console), the `voice-agent` Cloudflare tunnel
   (its token in `.env`), and `gh auth login` so `up` can set the `AWS_DEPLOY_ROLE_ARN` repo variable.
 - After it: point the Meta webhook at `https://voice-agent.njmtech.co.za/whatsapp` if it isn't already.
-- The first `infra` failed and the stack is in `ROLLBACK_COMPLETE`: `SKIP_BACKUP=1 scripts/deploy-server.sh down`, then `up`.
+- The first `infra` failed and the stack is in `ROLLBACK_COMPLETE`: `SKIP_BACKUP=1 legacy/deploy-server.sh down`, then `up`.
 - It stopped halfway: run `up` again. Every step is safe to repeat (n8n's owner setup prints an "already set up" error, which is fine).
 
 **Existing server, first time on a version with `backup`:** run `infra` once. It lets the instance write
@@ -186,14 +211,14 @@ AWS credentials in `~/.aws` (`aws login`). Commands that delete or replace data 
 
 **Change secrets or settings in `.env`:** `app` (stores the `.env` in SSM, then releases). `env` alone stores it for the next release.
 
-**Change the infrastructure:** edit `infra/ec2.yaml` and run `infra`, or `infra/github-ci.yaml` and run `ci`.
+**Change the infrastructure:** edit `legacy/ec2.yaml` and run `infra`, or `infra/aws/github-ci.yaml` and run `ci`.
 Check first that the change doesn't replace the instance (see "Replace the instance").
 
 **Look at the server:** `run '<command>'`, e.g. `run 'docker compose ps'` or `run 'docker compose logs --tail 100 agent'`.
 
 **Back up:** `backup` writes `.deploy/backups/voice-db-<UTC time>.sql.gz` (git-ignored, so copy it somewhere safe
 for keeping). It holds the call records and bookings. Not included: Metabase's own database (the dashboard is
-recreated by `metabase-setup.py`) and n8n's data (the workflows are in `n8n-workflows/`; credentials and execution
+recreated by `metabase-setup.py`) and n8n's data (the workflows are in `legacy/n8n-workflows/`; credentials and execution
 history are not). A copy also sits in the deploy bucket under `backups/` for 14 days.
 
 **Restore:** `restore` loads the newest file in `.deploy/backups/`; `restore <file>` loads that one.
@@ -209,7 +234,7 @@ reach the instance). For no costs at all, tear it down instead.
 security group, deploy bucket), the `/voice-agent/env` parameter and the `AWS_DEPLOY_ROLE_ARN` variable, so pushes
 to `main` skip the deploy job. Kept: the GitHub OIDC provider (shared with other repos), Bedrock model access,
 the Cloudflare tunnel and DNS records, and your local `.env` and backups.
-- The backup failed: nothing was deleted. Fix it, or delete without one: `SKIP_BACKUP=1 scripts/deploy-server.sh down`.
+- The backup failed: nothing was deleted. Fix it, or delete without one: `SKIP_BACKUP=1 legacy/deploy-server.sh down`.
 - The instance is stopped: start it first to keep the data, or use `SKIP_BACKUP=1` to give it up.
 - A stack ended in `DELETE_FAILED`: check its events in the CloudFormation console, then run `down` again.
 
@@ -218,7 +243,7 @@ the Cloudflare tunnel and DNS records, and your local `.env` and backups.
 **Replace the instance** (a new `ImageId`, a bigger disk, or a broken server): `backup`, make the change, `up`, `restore`.
 `up` re-runs every setup step on the new instance and points the CI role at it. For a broken server, `down` then `up`, `restore` does the same.
 
-## Latency notes
+### Latency notes
 - **Target:** about 1.5–2 s from the end of the caller's speech to the bot's first audio.
 - **Where it shows up:** Pipecat logs a TTFB for each service (STT, LLM, TTS).
 - **Main levers:**

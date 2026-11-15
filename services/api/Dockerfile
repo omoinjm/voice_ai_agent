@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 FROM python:3.12-slim
-# Same uv version and host-cache trick as agent/Dockerfile (see the comments there).
+# Same uv version and host-cache trick as services/agent/Dockerfile (see the comments there).
 COPY --from=ghcr.io/astral-sh/uv:0.9.21 /uv /usr/local/bin/uv
 WORKDIR /app
 COPY pyproject.toml uv.lock ./

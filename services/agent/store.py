@@ -1,4 +1,4 @@
-"""Saves calls to Postgres while they happen (schema: db/10-schema.sql).
+"""Saves calls to Postgres while they happen (schema: legacy/db/10-schema.sql).
 
 Every write is best-effort: a database problem is logged and never interrupts a live call.
 Without DATABASE_URL the store does nothing, so the bot still runs on its own.

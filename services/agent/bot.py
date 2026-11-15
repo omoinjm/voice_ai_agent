@@ -49,8 +49,8 @@ from voxcpm_tts import VoxCPMTTSService
 
 load_dotenv(override=True)
 
-# /shared in Docker; the repo's shared/ folder when run from agent/ locally.
-SHARED_DIR = Path(os.environ.get("SHARED_DIR", Path(__file__).resolve().parent.parent / "shared"))
+# /shared in Docker; the repo's legacy/shared/ folder when run from services/agent/ locally.
+SHARED_DIR = Path(os.environ.get("SHARED_DIR") or Path(__file__).resolve().parents[2] / "legacy" / "shared")
 
 
 def caller_info(runner_args: RunnerArguments) -> dict:

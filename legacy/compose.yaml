@@ -1,14 +1,21 @@
-# Voice agent stack: n8n (business flows + WhatsApp voice notes) and the Pipecat real-time bot.
-# The same file runs on the EC2 server (scripts/deploy-server.sh); only its .env differs.
-# VoxCPM2 TTS runs on Modal (tts/modal_app.py), not here: this machine has no GPU.
+# Single-business voice agent stack (the live server until the platform replaces it): n8n (business flows +
+# WhatsApp voice notes), the Pipecat real-time bot, Postgres and Metabase. The same file runs on the EC2 server
+# (legacy/deploy-server.sh); only its .env differs. VoxCPM2 TTS runs on Modal (services/tts/modal_app.py): no GPU here.
+#
+# Run from the repo root, with the root .env:
+#   docker compose -f legacy/compose.yaml --env-file .env up -d
+# The project name stays voice_ai_agent locally (the server overrides it to voice-agent with COMPOSE_PROJECT_NAME),
+# so existing volumes and networks keep their names.
 #
 # The openwa gateway is the existing `openwa-api` container (run from the carwash project's
 # openwa-gateway/). Join it to this network once so n8n and the gateway can reach each other:
 #   docker network connect voice_ai_agent_default openwa-api
+name: voice_ai_agent
+
 services:
   # Call records: calls, turns, tool calls and bookings (db/: schema + dashboard roles, applied on first start).
   # Published on 127.0.0.1:5433 only; the agent (host networking) connects there. On the server, query it with
-  #   scripts/deploy-server.sh run 'docker exec voice-db psql -U voice -c "select * from calls order by started_at desc limit 5"'
+  #   legacy/deploy-server.sh run 'docker exec voice-db psql -U voice -c "select * from calls order by started_at desc limit 5"'
   db:
     image: postgres:17-alpine
     container_name: voice-db
@@ -111,7 +118,7 @@ services:
 
   agent:
     build:
-      context: ./agent
+      context: ../services/agent
       # Host uv cache, reused by the Dockerfile so slow PyPI downloads aren't repeated.
       additional_contexts:
         uvcache: ${HOME}/.cache/uv
@@ -173,12 +180,12 @@ services:
     network_mode: host
     command: ["tunnel", "--no-autoupdate", "run", "--token", "${CF_TUNNEL_TOKEN}"]
 
-  # Modal CLI for deploying the VoxCPM2 TTS (tts/modal_app.py). Only runs on demand:
-  #   docker compose run --rm modal token new
-  #   docker compose run --rm modal deploy modal_app.py
+  # Modal CLI for deploying the VoxCPM2 TTS (services/tts/modal_app.py). Only runs on demand:
+  #   docker compose -f legacy/compose.yaml --env-file .env run --rm modal token new
+  #   docker compose -f legacy/compose.yaml --env-file .env run --rm modal deploy modal_app.py
   modal:
     build:
-      context: ./tts/cli
+      context: ../services/tts/cli
       additional_contexts:
         uvcache: ${HOME}/.cache/uv
       args:
@@ -188,7 +195,7 @@ services:
     environment:
       - MODAL_CONFIG_PATH=/config/.modal.toml
     volumes:
-      - ./tts:/tts
+      - ../services/tts:/tts
       - modal_config:/config
 
 volumes:

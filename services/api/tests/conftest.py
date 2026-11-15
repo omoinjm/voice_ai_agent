@@ -1,7 +1,7 @@
 """Test setup: a fresh `platform` schema in the platform_test database, migrated with Alembic, and an HTTP client.
 
 Run inside the API container:
-  docker compose -f platform/docker-compose.yml run --rm api pytest
+  docker compose run --rm api pytest
 """
 
 import asyncio

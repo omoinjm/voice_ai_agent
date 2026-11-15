@@ -8,11 +8,11 @@ Endpoints (all require `Authorization: Bearer $VOXCPM_TOKEN`):
   POST /v1/audio/stream        -> {"input": "...", "sample_rate": 24000}; chunked raw PCM16 mono streamed
                                   as it is generated. Closing the request stops generation (barge-in).
 
-Voice: if tts/voices/agent.wav + agent.txt exist, that clip is cloned ("ultimate cloning"). Otherwise
+Voice: if services/tts/voices/agent.wav + agent.txt exist, that clip is cloned ("ultimate cloning"). Otherwise
 VOICE_DESCRIPTION is used as a VoxCPM2 voice-design prompt, so the service works without a clip.
 
 Deploy:   modal secret create voxcpm-auth VOXCPM_TOKEN=<random>
-          modal deploy tts/modal_app.py
+          modal deploy services/tts/modal_app.py
 """
 
 import asyncio

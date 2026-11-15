@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-# Production image (ECS). Local development uses the `web` service in platform/docker-compose.yml instead.
+# Production image (ECS). Local development uses the `app` service in the root compose.yaml instead.
 FROM node:22-alpine AS deps
 WORKDIR /app
 COPY package.json package-lock.json ./

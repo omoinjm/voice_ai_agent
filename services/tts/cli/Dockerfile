@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-# Modal CLI image for deploying tts/modal_app.py. Installs from the host uv cache (the `uvcache`
+# Modal CLI image for deploying services/tts/modal_app.py. Installs from the host uv cache (the `uvcache`
 # build context, mounted at its host path because uv's cache entries are absolute symlinks), offline
 # first, falling back to PyPI with long timeouts.
 FROM python:3.12-slim

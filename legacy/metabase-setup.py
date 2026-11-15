@@ -1,7 +1,7 @@
 """One-off Metabase setup on the server: admin login, the read-only `dashboard` connection to the call
 records, and a "Bookings" dashboard. Safe to re-run: it skips whatever already exists.
 
-    scripts/deploy-server.sh run 'python3 scripts/metabase-setup.py'
+    legacy/deploy-server.sh run 'python3 legacy/metabase-setup.py'
 
 Reads METABASE_ADMIN_EMAIL (default below), METABASE_ADMIN_PASSWORD and DASHBOARD_DB_PASSWORD from .env.
 Uses only the standard library (it runs with the server's python3).

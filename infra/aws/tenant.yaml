@@ -1,0 +1,279 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  One tenant environment (staging or prod) on the shared platform (platform-core.yaml): the tenant's voice agent
+  as an ECS service with its own task and execution roles, log group and Cloud Map name
+  (<slug>-<env>.platform.internal, which the router sends calls to). Stack name: tenant-<slug>-<env>.
+  Created and updated by the provisioning workflow, not by hand. Before the stack is deployed, provisioning
+  creates the tenant's DB schema + role and the tenant secret (see TenantSecretArn).
+
+Parameters:
+  PlatformStackName:
+    Type: String
+    Default: voice-platform
+  TenantId:
+    Type: String
+    Description: The tenant's id in the control plane (platform.tenants.id).
+    AllowedPattern: ^[0-9a-f-]{36}$
+  TenantSlug:
+    Type: String
+    Description: Short unique name; also names the DB schema t_<slug>_<env> (dashes become underscores).
+    AllowedPattern: ^[a-z][a-z0-9-]{1,30}[a-z0-9]$
+  Environment:
+    Type: String
+    AllowedValues: [staging, prod]
+  AgentImageTag:
+    Type: String
+    Description: Tag in the platform's agent ECR repository. Promote copies staging's tag to prod.
+  ConfigVersion:
+    Type: Number
+    Description: Agent config version (platform.agent_configs). A new version rolls the tasks.
+    MinValue: 1
+  # JSON secret written by provisioning. Every key must exist (empty string is fine):
+  #   DATABASE_URL              postgresql://<tenant role>:<password>@<host>:5432/platform (schema t_<slug>_<env>)
+  #   WHATSAPP_TOKEN            the business's token (staging: our internal test number's)
+  #   WHATSAPP_PHONE_NUMBER_ID  likewise
+  #   YOCO_SECRET_KEY           the business's own Yoco key, or empty for pay-at-venue only
+  TenantSecretArn:
+    Type: String
+    AllowedPattern: ^arn:aws:secretsmanager:[a-z0-9-]+:\d{12}:secret:.+$
+  DesiredCount:
+    Type: Number
+    Default: 0
+    MinValue: 0
+    Description: Staging runs at 0 and is started on demand by "Test" (the control plane scales it, then back to 0).
+  MaxCount:
+    Type: Number
+    Default: 3
+    MinValue: 1
+    Description: Prod autoscaling ceiling (on CPU).
+  Cpu:
+    Type: String
+    Default: "1024"
+    AllowedValues: ["512", "1024", "2048", "4096"]
+  Memory:
+    Type: String
+    Default: "2048"
+    AllowedValues: ["1024", "2048", "3072", "4096", "8192"]
+  StunUrl:
+    Type: String
+    Default: stun:stun.l.google.com:19302
+    Description: The task only sees its private IP; STUN gives callers its public address for media.
+
+Conditions:
+  IsProd: !Equals [!Ref Environment, prod]
+
+Resources:
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${PlatformStackName}/tenants/${TenantSlug}-${Environment}"
+      RetentionInDays: 30
+
+  # Only this tenant's secret and the shared agent keys.
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: secrets
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref TenantSecretArn
+                  - Fn::ImportValue: !Sub "${PlatformStackName}-AgentSharedSecretArn"
+
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              ArnLike:
+                aws:SourceArn: !Sub "arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:*"
+      Policies:
+        - PolicyName: agent
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Claude and Nova through US cross-region inference profiles (same as the live server).
+              - Effect: Allow
+                Action: [bedrock:InvokeModel, bedrock:InvokeModelWithResponseStream]
+                Resource:
+                  - !Sub "arn:aws:bedrock:*:${AWS::AccountId}:inference-profile/us.*"
+                  - arn:aws:bedrock:*::foundation-model/anthropic.*
+                  - arn:aws:bedrock:*::foundation-model/amazon.nova*
+              # This tenant's custom voice reference audio only.
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub
+                  - "arn:aws:s3:::${Bucket}/tenants/${TenantSlug}/*"
+                  - Bucket:
+                      Fn::ImportValue: !Sub "${PlatformStackName}-VoicesBucket"
+              # The agent protects its task from scale-in while a call is live (ECS task scale-in protection).
+              - Effect: Allow
+                Action: [ecs:GetTaskProtection, ecs:UpdateTaskProtection]
+                Resource: !Sub
+                  - "arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:task/${Cluster}/*"
+                  - Cluster:
+                      Fn::ImportValue: !Sub "${PlatformStackName}-ClusterName"
+              # ECS Exec for debugging a live task.
+              - Effect: Allow
+                Action:
+                  - ssmmessages:CreateControlChannel
+                  - ssmmessages:CreateDataChannel
+                  - ssmmessages:OpenControlChannel
+                  - ssmmessages:OpenDataChannel
+                Resource: "*"
+
+  Discovery:
+    Type: AWS::ServiceDiscovery::Service
+    Properties:
+      Name: !Sub "${TenantSlug}-${Environment}"
+      NamespaceId:
+        Fn::ImportValue: !Sub "${PlatformStackName}-NamespaceId"
+      DnsConfig:
+        RoutingPolicy: MULTIVALUE
+        DnsRecords: [{ Type: A, TTL: 10 }]
+      HealthCheckCustomConfig: { FailureThreshold: 1 }
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "tenant-${TenantSlug}-${Environment}"
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: !Ref Cpu
+      Memory: !Ref Memory
+      RuntimePlatform: { CpuArchitecture: X86_64, OperatingSystemFamily: LINUX }
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: agent
+          Image: !Sub
+            - "${Repo}:${AgentImageTag}"
+            - Repo:
+                Fn::ImportValue: !Sub "${PlatformStackName}-AgentRepositoryUri"
+          Essential: true
+          PortMappings: [{ ContainerPort: 7860, Protocol: tcp }]
+          # Tenant mode: the agent loads its persona, tools and voice for (TENANT_ID, CONFIG_VERSION) from the
+          # platform database instead of legacy/shared/.
+          Environment:
+            - { Name: TENANT_ID, Value: !Ref TenantId }
+            - { Name: TENANT_SLUG, Value: !Ref TenantSlug }
+            - { Name: ENV, Value: !Ref Environment }
+            - { Name: CONFIG_VERSION, Value: !Ref ConfigVersion }
+            - { Name: AWS_REGION, Value: !Ref AWS::Region }
+            - { Name: STUN_URL, Value: !Ref StunUrl }
+            - Name: VOICES_BUCKET
+              Value:
+                Fn::ImportValue: !Sub "${PlatformStackName}-VoicesBucket"
+          Secrets:
+            - { Name: DATABASE_URL, ValueFrom: !Sub "${TenantSecretArn}:DATABASE_URL::" }
+            - { Name: WHATSAPP_TOKEN, ValueFrom: !Sub "${TenantSecretArn}:WHATSAPP_TOKEN::" }
+            - { Name: WHATSAPP_PHONE_NUMBER_ID, ValueFrom: !Sub "${TenantSecretArn}:WHATSAPP_PHONE_NUMBER_ID::" }
+            - { Name: YOCO_SECRET_KEY, ValueFrom: !Sub "${TenantSecretArn}:YOCO_SECRET_KEY::" }
+            - Name: DEEPGRAM_API_KEY
+              ValueFrom: !Sub
+                - "${Shared}:DEEPGRAM_API_KEY::"
+                - Shared:
+                    Fn::ImportValue: !Sub "${PlatformStackName}-AgentSharedSecretArn"
+            - Name: VOXCPM_URL
+              ValueFrom: !Sub
+                - "${Shared}:VOXCPM_URL::"
+                - Shared:
+                    Fn::ImportValue: !Sub "${PlatformStackName}-AgentSharedSecretArn"
+            - Name: VOXCPM_TOKEN
+              ValueFrom: !Sub
+                - "${Shared}:VOXCPM_TOKEN::"
+                - Shared:
+                    Fn::ImportValue: !Sub "${PlatformStackName}-AgentSharedSecretArn"
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: agent
+
+  # Prod on regular Fargate; staging on Fargate Spot (an interruption only drops a test call).
+  Service:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: !Sub "${TenantSlug}-${Environment}"
+      Cluster:
+        Fn::ImportValue: !Sub "${PlatformStackName}-ClusterName"
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: !Ref DesiredCount
+      CapacityProviderStrategy:
+        - CapacityProvider: !If [IsProd, FARGATE, FARGATE_SPOT]
+          Weight: 1
+      EnableExecuteCommand: true
+      PropagateTags: SERVICE
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+        DeploymentCircuitBreaker: { Enable: true, Rollback: true }
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED      # needed for WebRTC media and image pulls (no NAT)
+          Subnets: !Split
+            - ","
+            - Fn::ImportValue: !Sub "${PlatformStackName}-PublicSubnetIds"
+          SecurityGroups:
+            - Fn::ImportValue: !Sub "${PlatformStackName}-AgentSecurityGroupId"
+      ServiceRegistries:
+        - RegistryArn: !GetAtt Discovery.Arn
+      Tags:
+        - { Key: tenant, Value: !Ref TenantSlug }
+        - { Key: env, Value: !Ref Environment }
+
+  # Prod only: scale on CPU between DesiredCount (at least 1) and MaxCount. Live calls hold scale-in protection.
+  ScalableTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Condition: IsProd
+    Properties:
+      ServiceNamespace: ecs
+      ScalableDimension: ecs:service:DesiredCount
+      ResourceId: !Sub
+        - "service/${Cluster}/${Service.Name}"
+        - Cluster:
+            Fn::ImportValue: !Sub "${PlatformStackName}-ClusterName"
+      MinCapacity: !Ref DesiredCount
+      MaxCapacity: !Ref MaxCount
+
+  CpuScaling:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Condition: IsProd
+    Properties:
+      PolicyName: !Sub "${TenantSlug}-${Environment}-cpu"
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref ScalableTarget
+      TargetTrackingScalingPolicyConfiguration:
+        PredefinedMetricSpecification: { PredefinedMetricType: ECSServiceAverageCPUUtilization }
+        TargetValue: 60
+        ScaleOutCooldown: 60
+        ScaleInCooldown: 300
+
+Outputs:
+  ServiceName:
+    Value: !GetAtt Service.Name
+  ServiceArn:
+    Value: !Ref Service
+  AgentHost:
+    Description: Where the router sends this tenant environment's signalling.
+    Value: !Sub "${TenantSlug}-${Environment}.platform.internal:7860"   # platform-core's Cloud Map namespace
+  LogGroupName:
+    Value: !Ref LogGroup

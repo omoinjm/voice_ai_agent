@@ -202,18 +202,34 @@ Resources:
           ToPort: 3000
           SourceSecurityGroupId: !Ref TunnelSecurityGroup
 
-  # Shared by every tenant agent task (tenant.yaml). aiortc picks random UDP ports for each call's media.
-  # Signalling ingress from the router is added with the router.
+  # The router (later milestone): Meta webhooks and browser signalling arrive through the tunnel on 8080.
+  RouterSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Router - from the tunnel only
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !Ref TunnelSecurityGroup
+
+  # Shared by every tenant agent task (tenant.yaml). aiortc picks random UDP ports for each call's media;
+  # signalling (the bot's HTTP port) comes only from the router.
   AgentSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Tenant agents - WebRTC media
+      GroupDescription: Tenant agents - WebRTC media, signalling from the router
       VpcId: !Ref Vpc
       SecurityGroupIngress:
         - IpProtocol: udp
           FromPort: 1024
           ToPort: 65535
           CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 7860
+          ToPort: 7860
+          SourceSecurityGroupId: !Ref RouterSecurityGroup
 
   DatabaseSecurityGroup:
     Type: AWS::EC2::SecurityGroup
@@ -635,6 +651,15 @@ Resources:
       Description: Cloudflare tunnel token for the platform's cloudflared service
       SecretString: replace-me
 
+  # Keys every tenant agent shares (ours, not the tenant's): DEEPGRAM_API_KEY, VOXCPM_URL, VOXCPM_TOKEN.
+  # Set the real values once; tenant stacks inject them by key, so every key must exist (empty is fine).
+  AgentSharedSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${AWS::StackName}/agent-shared"
+      Description: Platform-wide keys injected into every tenant agent
+      SecretString: '{"DEEPGRAM_API_KEY": "replace-me", "VOXCPM_URL": "", "VOXCPM_TOKEN": ""}'
+
   ExecutionRole:
     Type: AWS::IAM::Role
     Properties:
@@ -922,6 +947,9 @@ Outputs:
   AgentRepositoryUri:
     Value: !GetAtt AgentRepository.RepositoryUri
     Export: { Name: !Sub "${AWS::StackName}-AgentRepositoryUri" }
+  AgentSharedSecretArn:
+    Value: !Ref AgentSharedSecret
+    Export: { Name: !Sub "${AWS::StackName}-AgentSharedSecretArn" }
   ApiRepositoryUri:
     Value: !GetAtt ApiRepository.RepositoryUri
   AppRepositoryUri:

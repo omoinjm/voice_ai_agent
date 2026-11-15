@@ -16,7 +16,7 @@ This repo holds two things:
 | `services/api/` | Control-plane API (FastAPI, SQLAlchemy, Alembic): businesses, onboarding, review, provisioning, dashboards |
 | `services/agent/` | Pipecat voice agent, used by both the live server and (soon) the platform |
 | `services/tts/` | VoxCPM2 text-to-speech on Modal |
-| `infra/aws/` | CloudFormation: the platform's shared core (`platform-core.yaml`) and the GitHub Actions deploy role (`github-ci.yaml`); per-tenant stacks will go here |
+| `infra/aws/` | CloudFormation: the platform's shared core (`platform-core.yaml`) and one stack per tenant environment (`tenant.yaml`), and the GitHub Actions deploy role (`github-ci.yaml`) |
 | `infra/local/` | Local-only setup, such as the platform database's init scripts |
 | `legacy/` | The live single-business server: `compose.yaml`, `deploy-server.sh`, `ec2.yaml`, `metabase-setup.py`, Postgres schema (`db/`), n8n workflows (`n8n-workflows/`), prompt and tool list (`shared/`) |
 | `compose.yaml` | Local platform stack: `docker compose up -d --build`, then the app on http://localhost:3100 and the API on http://localhost:8100/docs |
@@ -27,8 +27,9 @@ This repo holds two things:
 One shared stack in us-east-1: VPC (public subnets for tasks, private for RDS, no NAT), ECS Fargate cluster with
 Cloud Map (`*.platform.internal`), RDS Postgres 17 with pgvector, S3 buckets for documents and voice samples,
 Cognito (user pool, `platform_admin` group, PKCE app client, login domain), ECR repositories (`api`, `app`,
-`router`, `agent`, `workers`), an SES domain identity, an SNS alerts topic, and the `api`, `app` and `cloudflared`
-services. Each tenant environment will be its own `tenant.yaml` stack importing this one's exports. Not deployed yet.
+`router`, `agent`, `workers`), an SES domain identity, an SNS alerts topic, the shared agent keys secret, and the
+`api`, `app` and `cloudflared` services. Each tenant environment is its own `tenant.yaml` stack importing this
+one's exports. Not deployed yet.
 
 First deploy (services start at 0 tasks, because no images exist yet; AWS CLI run through Docker):
 
@@ -50,6 +51,17 @@ Then:
 4. **Run:** redeploy with `ApiImageTag`, `AppImageTag` and `ApiDesiredCount=1 AppDesiredCount=1 TunnelDesiredCount=1`
    (`cloudformation deploy` keeps the previous value of any parameter you leave out).
 5. **Admins:** after signing up in the app, add yourself to the `platform_admin` group in Cognito.
+6. **Agent keys:** put the real `DEEPGRAM_API_KEY` (and `VOXCPM_URL`/`VOXCPM_TOKEN` if used) in the
+   `voice-platform/agent-shared` secret.
+
+### Tenant environments (`infra/aws/tenant.yaml`)
+
+One stack per tenant per environment, named `tenant-<slug>-<env>` (`env` is `staging` or `prod`): the tenant's
+agent as an ECS service on the shared cluster, reachable by the router at `<slug>-<env>.platform.internal:7860`,
+with its own roles (Bedrock, its own voice files, its own secret) and log group. Staging runs on Fargate Spot at 0
+tasks until someone presses "Test"; prod runs on Fargate and scales on CPU. The provisioning workflow deploys these
+stacks. Before it does, it creates the tenant's database schema and role and a JSON secret with the keys
+`DATABASE_URL`, `WHATSAPP_TOKEN`, `WHATSAPP_PHONE_NUMBER_ID` and `YOCO_SECRET_KEY` (all must exist; empty is fine).
 
 ## The live single-business agent
 

@@ -1,0 +1,111 @@
+# Local development stack for the SaaS platform. (The single-business server that is live today runs
+# legacy/compose.yaml instead; see legacy/deploy-server.sh.)
+#   docker compose up -d --build
+#   App (merchant portal + /admin): http://localhost:3100    API: http://localhost:8100/docs
+#   API tests: docker compose run --rm api pytest
+# Auth is in dev mode: sign in with any email locally (tick "Platform admin" for the admin console), or send
+# `Authorization: Bearer dev:you@example.com` (`:admin` appended for a platform admin) to the API.
+name: voice-platform
+
+services:
+  db:
+    image: pgvector/pgvector:pg17
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5434:5432"
+    environment:
+      - POSTGRES_USER=platform
+      - POSTGRES_PASSWORD=platform
+      - POSTGRES_DB=platform
+    volumes:
+      - db_data:/var/lib/postgresql/data
+      - ./infra/local/db-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "platform"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  api:
+    build:
+      context: ./services/api
+      additional_contexts:
+        uvcache: ${HOME}/.cache/uv
+      args:
+        HOST_UV_CACHE: ${HOME}/.cache/uv
+        INSTALL_DEV: "1"
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8100:8000"
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://platform:platform@db:5432/platform
+      - ENVIRONMENT=local
+      - AUTH_MODE=dev
+      - CORS_ORIGINS=["http://localhost:3100"]
+      - AWS_REGION=us-east-1
+    volumes:
+      # Live code for --reload; the venv stays in the image.
+      - ./services/api/app:/app/app
+      - ./services/api/migrations:/app/migrations
+      - ./services/api/tests:/app/tests
+    # dev_tenant: a "demo" tenant schema + agent config for the `agent` service (stands in for provisioning).
+    command: ["sh", "-c", "alembic upgrade head && python -m app.dev_tenant && exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"]
+    depends_on:
+      db:
+        condition: service_healthy
+
+  # Next.js dev server with hot reload. node_modules lives in a volume so the host never needs npm.
+  app:
+    image: node:22-alpine
+    restart: unless-stopped
+    working_dir: /app
+    ports:
+      - "127.0.0.1:3100:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:8100
+      - NEXT_PUBLIC_AUTH_MODE=dev
+      - NEXT_TELEMETRY_DISABLED=1
+      - WATCHPACK_POLLING=true
+    volumes:
+      - ./apps/app:/app
+      - app_node_modules:/app/node_modules
+    command: ["sh", "-c", "npm ci && exec npm run dev -- --hostname 0.0.0.0 --port 3000"]
+    depends_on:
+      - api
+
+  # The voice agent in tenant mode, as the "demo" tenant's staging environment (seeded by the api service).
+  # Opt-in: docker compose --profile agent up -d --build agent, then http://localhost:7870 for a browser call
+  # (needs DEEPGRAM_API_KEY in the environment and AWS credentials in ~/.aws for Bedrock).
+  # Tests: docker compose --profile agent run --rm agent pytest
+  agent:
+    profiles: [agent]
+    build:
+      context: ./services/agent
+      additional_contexts:
+        uvcache: ${HOME}/.cache/uv
+      args:
+        HOST_UV_CACHE: ${HOME}/.cache/uv
+        INSTALL_DEV: "1"
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:7870:7860"
+    environment:
+      - TENANT_ID=00000000-0000-4000-8000-000000000001
+      - TENANT_SLUG=demo
+      - TENANT_ENV=staging
+      - CONFIG_VERSION=1
+      - DATABASE_URL=postgresql://t_demo_staging:localdemotenantpassword1@db:5432/platform
+      - AWS_REGION=us-east-1
+      - DEEPGRAM_API_KEY=${DEEPGRAM_API_KEY:-}
+    volumes:
+      - ./services/agent:/app/src:ro
+      - ${HOME}/.aws:/root/.aws:ro
+    working_dir: /app/src
+    command: ["python", "bot.py", "-t", "webrtc", "--host", "0.0.0.0", "--port", "7860"]
+    depends_on:
+      api:
+        condition: service_started
+
+volumes:
+  db_data:
+  app_node_modules:

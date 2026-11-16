@@ -1,7 +1,7 @@
 # Checks on every PR and push; pushes to main then deploy to the EC2 server and smoke-test it.
-# Deploying uses the voice-agent-github-deploy role (infra/github-ci.yaml) through GitHub OIDC: no AWS keys are
+# Deploying uses the voice-agent-github-deploy role (infra/aws/github-ci.yaml) through GitHub OIDC: no AWS keys are
 # stored here. Its ARN is the repo variable AWS_DEPLOY_ROLE_ARN. The server's .env stays in AWS SSM
-# (`scripts/deploy-server.sh env` from a machine with the .env); this workflow only ships code.
+# (`legacy/deploy-server.sh env` from a machine with the .env); this workflow only ships code.
 name: CI/CD
 
 on:
@@ -20,18 +20,20 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Lint Python (ruff)
-        run: docker run --rm -v "$PWD:/src:ro" -w /src ghcr.io/astral-sh/ruff:0.14.0 check --no-cache --output-format github agent tts scripts
+        run: docker run --rm -v "$PWD:/src:ro" -w /src ghcr.io/astral-sh/ruff:0.14.0 check --no-cache --output-format github services/agent services/tts legacy
 
       - name: Lint shell scripts (shellcheck)
-        run: docker run --rm -v "$PWD:/mnt:ro" koalaman/shellcheck:v0.10.0 --severity=warning scripts/deploy-server.sh db/20-roles.sh
+        run: docker run --rm -v "$PWD:/mnt:ro" koalaman/shellcheck:v0.10.0 --severity=warning legacy/deploy-server.sh legacy/db/20-roles.sh
 
       - name: Validate CloudFormation (cfn-lint)
         run: |
           pip install --quiet cfn-lint==1.40.0
-          cfn-lint infra/*.yaml
+          cfn-lint infra/aws/*.yaml legacy/ec2.yaml
 
-      - name: Validate docker-compose.yml
-        run: docker compose --profile dashboard config --quiet
+      - name: Validate the compose files
+        run: |
+          docker compose -f legacy/compose.yaml --profile dashboard --profile tools config --quiet
+          docker compose config --quiet
         env:
           DB_PASSWORD: ci
 
@@ -40,10 +42,35 @@ jobs:
           # The Dockerfile reads a host uv cache as a build context; CI has none, so it installs from PyPI.
           mkdir -p "$RUNNER_TEMP/uvcache"
           docker build --build-context uvcache="$RUNNER_TEMP/uvcache" --build-arg HOST_UV_CACHE=/uvcache \
-            -t voice-agent:ci agent
+            -t voice-agent:ci services/agent
 
       - name: Import-check the agent
-        run: docker run --rm -e SHARED_DIR=/shared -v "$PWD/shared:/shared:ro" voice-agent:ci python -c "import bot, store, tools, notify"
+        run: docker run --rm -e SHARED_DIR=/shared -v "$PWD/legacy/shared:/shared:ro" voice-agent:ci python -c "import bot, store, tools, notify"
+
+  # The SaaS platform (root compose.yaml): control-plane API and the merchant/admin app. Not deployed yet.
+  platform:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: API lint and tests
+        run: |
+          # The API Dockerfile reads a host uv cache as a build context; CI has none, so it installs from PyPI.
+          mkdir -p "$HOME/.cache/uv"
+          docker compose build api
+          docker compose up -d --wait db
+          docker compose run --rm --no-deps api sh -c "ruff check . && ruff format --check . && pytest -q"
+
+      - name: Agent tests (tenant mode, against the local demo tenant)
+        run: |
+          docker compose --profile agent build agent
+          docker compose run --rm --no-deps api sh -c "alembic upgrade head && python -m app.dev_tenant"
+          docker compose --profile agent run --rm --no-deps agent pytest -q
+
+      - name: App lint, typecheck and build
+        run: |
+          docker run --rm -v "$PWD/apps/app:/app" -w /app -e NEXT_TELEMETRY_DISABLED=1 node:22-alpine \
+            sh -c "npm ci && npm run lint && npx tsc --noEmit && npm run build"
 
   deploy:
     needs: checks
@@ -67,12 +94,12 @@ jobs:
           aws-region: us-east-1
 
       - name: Release to EC2
-        run: scripts/deploy-server.sh release
+        run: legacy/deploy-server.sh release
 
       - name: Smoke test (on the server)
         # Checked from the server through SSM: Cloudflare answers GitHub's runner IPs with 403 (bot protection).
         run: |
-          scripts/deploy-server.sh run '
+          legacy/deploy-server.sh run '
           check() {
             for i in $(seq 1 30); do curl -sf -o /dev/null -L "$2" && { echo "$1 OK"; return 0; }; sleep 10; done
             echo "$1 FAILED: $2"; return 1
